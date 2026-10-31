@@ -2,7 +2,7 @@
   "metadata": {
     "display_name": "ResinLoop Daily Watch",
     "short_desc": "Reminds you when Genshin / HSR / ZZZ / Arknights / Endfield dailies are not finished",
-    "desc": "AstrBot plugin ported from ResinLoop. Daily-check tracking for Genshin Impact, Honkai: Star Rail, Zenless Zone Zero, Arknights and Endfield. Accounts are isolated per user (platform + sender), so every member binds and queries their own. Read-only: no check-in, no rewards, no data changes."
+    "desc": "AstrBot plugin ported from ResinLoop. Tracks daily tasks in Genshin Impact, Honkai: Star Rail, Zenless Zone Zero, Arknights and Endfield; alerts only when something is left undone, with resin overflow and ending-event warnings. Accounts are isolated per user. Read-only: no check-in, no rewards."
   },
   "config": {
     "check_times": {

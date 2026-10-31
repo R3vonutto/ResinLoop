@@ -470,7 +470,7 @@ def test_plugin_commands() -> None:
     check("/日常 订阅 不再污染全局配置", plugin.config["push_targets"] == [])
 
     results = asyncio.run(collect(group))
-    check("重复订阅提示已存在", "已经在你的提醒列表" in results[-1][1])
+    check("重复订阅提示已存在", "已经在提醒列表里" in results[-1][1])
 
     results = asyncio.run(collect(FakeEvent("日常 退订", umo="aiocqhttp:GroupMessage:555", sender="1")))
     check("/日常 退订 清空本人订阅", plugin._store.profile("aiocqhttp:1").targets == [])
@@ -666,7 +666,7 @@ def test_multi_user() -> None:
         check("认领后配置被清空", plugin_legacy.config["accounts"] == [])
         claimed = plugin_legacy._store.profile("aiocqhttp:2001")
         check("旧账号已并入管理员", [item.game for item in claimed.accounts] == ["genshin", "arknights"])
-        check("认领回执可读", "并入你名下" in results[-1][1], results[-1][1][:80])
+        check("认领回执可读", "已并入" in results[-1][1], results[-1][1][:80])
         check(
             "旧历史存档随之迁移",
             user_history.path_for("aiocqhttp:2001").exists(),

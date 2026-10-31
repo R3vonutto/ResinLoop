@@ -413,7 +413,7 @@ class ResinLoopPlugin(Star):
                 )
                 return
 
-        yield event.plain_result("正在查询，稍等…" if not force_push else "正在查询并测试推送…")
+        yield event.plain_result("查询中…" if not force_push else "查询中，测试推送…")
 
         user_settings = settings.for_accounts(profile.accounts)
         result = await self._run_once(
@@ -435,14 +435,18 @@ class ResinLoopPlugin(Star):
             targets = self._resolve_targets(profile, settings)
             if not targets:
                 yield event.plain_result(
-                    "你还没有可用的提醒去处：私聊我一次，或在某个会话里发 /日常 订阅。"
+                    "没有可推送的会话：先私聊我一次，或发 /日常 订阅。"
                 )
                 return
-            push_title, push_body = result.report.to_push_payload()
+            push_body = texts.push_text(result.report)
             delivery = await pusher.push_to_sessions(
-                self.context, targets, f"{push_title}\n{push_body}"
+                self.context, targets, push_body
             )
-            yield event.plain_result(f"推送结果：{pusher.DeliveryReport(delivery).summary()}")
+            outcomes = pusher.DeliveryReport(delivery).outcomes
+            ok = sum(1 for item in outcomes if item.ok)
+            yield event.plain_result(
+                f"推送 {ok}/{len(outcomes)} 成功" if outcomes else "没有可推送的会话"
+            )
         elif result.cred_alerts:
             yield event.plain_result(texts.cred_alert_text(result.cred_alerts))
 
@@ -480,7 +484,6 @@ class ResinLoopPlugin(Star):
             last_run=await self._last_run(),
             next_run=next_run_at(settings) if scheduler_running else None,
             scheduler_running=scheduler_running,
-            stats=self._store.stats(),
         )
 
     # ------------------------------------------------------------------ #
@@ -536,10 +539,9 @@ class ResinLoopPlugin(Star):
             if alert:
                 alert_count += 1
                 if targets:
-                    title, body = report.to_push_payload()
                     header = "" if len(profiles) == 1 else f"{profile.display} 的日常\n"
                     delivery = await pusher.push_to_sessions(
-                        self.context, targets, f"{header}{title}\n{body}"
+                        self.context, targets, f"{header}{texts.push_text(report)}"
                     )
                     logger.info("%s 推送结果：%s", profile.key, delivery)
                 else:
@@ -575,7 +577,7 @@ class ResinLoopPlugin(Star):
             parts.append(f"{len(report.resource_alerts)} 个体力将溢出")
         if report.activity_alerts:
             parts.append(f"{len(report.activity_alerts)} 个活动将结束")
-        return f"· {profile.display}：{'、'.join(parts)}"
+        return f"{profile.display}：{'、'.join(parts)}"
 
     async def _deliver_webhook(self, settings, profiles, single_report, summaries) -> None:
         """Webhook（Bark/飞书…）永远是「整台机器人一个配置」，这里做脱敏汇总。
@@ -585,11 +587,14 @@ class ResinLoopPlugin(Star):
         """
         try:
             if len(profiles) == 1 and single_report is not None:
-                title, body = single_report.to_push_payload()
+                title = (
+                    f"游戏日常 {len(single_report.finished)}/{len(single_report.statuses)}"
+                )
+                body = texts.push_text(single_report)
             else:
                 if not summaries:
                     return
-                title = f"ResinLoop：{len(summaries)} 人有未完成项"
+                title = f"{len(summaries)} 人有未完成项"
                 body = "\n".join(summaries)
             delivery = await pusher.deliver(
                 self.context, settings, title, body, targets=[]
@@ -634,14 +639,10 @@ class ResinLoopPlugin(Star):
         if subscribe:
             added = self._store.subscribe(profile.key, umo)
             profile = self._store.profile(profile.key)
-            head = "已把当前会话加入你的提醒列表" if added else "当前会话已经在你的提醒列表里"
+            head = "已加入提醒列表" if added else "已经在提醒列表里"
             lines = [f"{head}（共 {len(profile.targets)} 个）：", umo]
             if not profile.has_accounts:
-                lines.append("")
-                lines.append("但你还没绑定账号，先发 /日常 登录米游社 或 /日常 登录森空岛。")
-            if profile.private_umo:
-                lines.append("")
-                lines.append("你在私聊里也发过命令，默认会把提醒发到私聊；群里不会看到你的账号状态。")
+                lines.append("还没绑定账号：/日常 登录米游社 或 /日常 登录森空岛")
             return "\n".join(lines)
 
         removed = self._store.unsubscribe(profile.key, umo)
@@ -723,17 +724,13 @@ class ResinLoopPlugin(Star):
         key = profile.key
 
         if key in self._login_sessions:
-            yield event.plain_result(
-                f"你有一个 {self._login_sessions[key]} 扫码会话在等待，"
-                "先完成或等它超时（3 分钟）。"
-            )
+            yield event.plain_result("已有扫码会话在等待，先完成或等 3 分钟超时。")
             return
 
         settings = self._settings()
         if len(self._login_sessions) >= settings.max_login_sessions:
             yield event.plain_result(
-                f"同时进行的扫码会话已达上限（{settings.max_login_sessions} 个），"
-                "稍等别人扫完再来。"
+                f"扫码会话已满（{settings.max_login_sessions} 个），稍后再试。"
             )
             return
 
@@ -753,11 +750,9 @@ class ResinLoopPlugin(Star):
         if session.png is not None:
             chain.append(Image.fromFileSystem(str(session.png)))
         else:
-            chain.append(Plain("（二维码图片生成失败，请把下面这串内容转成二维码）\n"))
+            chain.append(Plain("二维码图片生成失败，链接：\n"))
             chain.append(Plain(session.url))
-        tail = f"\n{session.hint()}，3 分钟内有效。\n绑定只写到你名下，不影响其他人。"
-        if not self._is_private(event):
-            tail += "\n（二维码别刷群：建议私聊我扫码，这里只贴这一次）"
+        tail = f"\n{session.hint()}，3 分钟内有效。"
         chain.append(Plain(tail))
         yield event.chain_result(chain)
 
@@ -780,15 +775,12 @@ class ResinLoopPlugin(Star):
                 games = settings_mod.apply_mihoyo_login(
                     {"accounts": rows}, payload["cookie"], payload.get("roles") or {}
                 )
-                extra = f"设备已绑定：{payload['device_id'][:8]}…（三款游戏共用）"
             else:
                 payload = await login.finish_skland(session)
                 rows = self._store.login_rows(key)
                 games = settings_mod.apply_skland_login({"accounts": rows}, payload["token"])
-                extra = f"Token 已保存（{settings_mod.mask_secret(payload['token'])}）"
             self._store.save_login_rows(key)
-            text = texts.login_done_text(session.kind, games, extra)
-            text += "\n这些账号只属于你，其他人查不到。"
+            text = texts.login_done_text(session.kind, games)
         except login.LoginError as exc:
             text = f"❌ 登录失败：{exc}"
         except asyncio.CancelledError:
@@ -820,7 +812,7 @@ class ResinLoopPlugin(Star):
         """
         profile = self._profile(event)
         if not profile.has_accounts:
-            return "这位用户还没有绑定任何游戏账号。提示他私聊发送 /日常 登录米游社 或 /日常 登录森空岛 自行绑定。"
+            return "这位用户还没绑定账号，提示他发 /日常 登录米游社 或 /日常 登录森空岛。"
 
         settings = self._settings().for_accounts(profile.accounts)
         result = await self._run_once(
