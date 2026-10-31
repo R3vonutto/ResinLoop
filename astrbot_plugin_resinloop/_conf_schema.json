@@ -1,0 +1,228 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用定时检查",
+    "default": true,
+    "hint": "关掉后只有手动 /日常 才会查询，不再按时间点推送"
+  },
+  "check_times": {
+    "type": "list",
+    "description": "每日检查时间点",
+    "default": ["08:30", "20:30"],
+    "items": {
+      "type": "string"
+    },
+    "hint": "24 小时制 HH:MM，可填多个（例如 08:30、20:30）。补发窗口内漏跑会自动补一次"
+  },
+  "catch_up_minutes": {
+    "type": "int",
+    "description": "错过时间点后的补发窗口（分钟）",
+    "default": 180,
+    "hint": "电脑/机器人休眠错过时间点时，只要在窗口内醒来就补跑一次；0 表示不补发，最大 720"
+  },
+  "push_targets": {
+    "type": "list",
+    "description": "提醒接收会话（UMO）",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "在群里发 /日常 订阅 会自动填入，一般不用手改。格式：平台:group|private:会话ID"
+  },
+  "always_notify": {
+    "type": "bool",
+    "description": "全部完成也发一条平安通知",
+    "default": false,
+    "hint": "默认只在有未完成项 / 体力溢出 / 活动即将结束时才推送"
+  },
+  "test_mode": {
+    "type": "string",
+    "description": "推送模式",
+    "default": "auto",
+    "options": ["auto", "force_alert", "force_silent"],
+    "labels": ["自动判断（有未完成才推）", "强制提醒（每轮都推）", "强制静默（只写日志）"],
+    "hint": "排查推送通道时临时切「强制提醒」，确认没问题再切回 auto"
+  },
+  "accounts": {
+    "type": "template_list",
+    "description": "游戏账号",
+    "hint": "推荐用 /日常 登录米游社、/日常 登录森空岛 扫码自动写入，手填只用于迁移旧配置",
+    "templates": {
+      "account": {
+        "name": "游戏账号",
+        "items": {
+          "game": {
+            "type": "string",
+            "description": "游戏",
+            "default": "genshin",
+            "options": ["genshin", "starrail", "zzz", "arknights", "endfield"],
+            "labels": ["原神", "崩坏：星穹铁道", "绝区零", "明日方舟", "终末地"]
+          },
+          "nickname": {
+            "type": "string",
+            "description": "备注昵称",
+            "default": "",
+            "hint": "只用于展示，可留空（扫码登录会自动回填游戏内昵称）"
+          },
+          "enabled": {
+            "type": "bool",
+            "description": "参与巡查",
+            "default": true
+          },
+          "cookie": {
+            "type": "text",
+            "description": "米游社 Cookie",
+            "default": "",
+            "secret": true,
+            "hint": "米游社三款游戏（原神/崩铁/绝区零）用；扫码登录会自动填。格式：ltuid=...; ltoken=...; cookie_token=..."
+          },
+          "uid": {
+            "type": "string",
+            "description": "游戏内 UID",
+            "default": "",
+            "hint": "米游社三款游戏必填（扫码登录会自动回填）"
+          },
+          "server": {
+            "type": "string",
+            "description": "区服",
+            "default": "",
+            "hint": "原神 cn_gf01 / 崩铁与绝区零 prod_gf_cn；留空按默认值"
+          },
+          "token": {
+            "type": "string",
+            "description": "鹰角通行证 Token",
+            "default": "",
+            "secret": true,
+            "hint": "明日方舟 / 终末地用；扫码登录会自动填"
+          }
+        }
+      }
+    }
+  },
+  "resource_alert_enabled": {
+    "type": "bool",
+    "description": "体力溢出预警",
+    "default": true,
+    "hint": "复用同一轮查询结果判定，不额外发请求；达到阈值就推一条"
+  },
+  "resource_thresholds": {
+    "type": "dict",
+    "description": "各游戏体力溢出阈值",
+    "hint": "当前值 ≥ 阈值即预警；填 0 表示该游戏关闭预警",
+    "template_schema": {
+      "genshin": {
+        "type": "int",
+        "description": "原粹树脂",
+        "default": 160
+      },
+      "starrail": {
+        "type": "int",
+        "description": "开拓力",
+        "default": 240
+      },
+      "zzz": {
+        "type": "int",
+        "description": "电量",
+        "default": 200
+      },
+      "arknights": {
+        "type": "int",
+        "description": "理智（明日方舟）",
+        "default": 135
+      },
+      "endfield": {
+        "type": "int",
+        "description": "理智（终末地）",
+        "default": 300
+      }
+    }
+  },
+  "activity_alert_enabled": {
+    "type": "bool",
+    "description": "活动结束提醒",
+    "default": true,
+    "hint": "活动结束前 N 天在推送末尾追加提醒；活动日历每天最多拉一次"
+  },
+  "activity_alert_days": {
+    "type": "int",
+    "description": "活动提前提醒天数",
+    "default": 3,
+    "hint": "1~30，默认提前 3 天"
+  },
+  "mihoyo_enabled": {
+    "type": "bool",
+    "description": "启用米游社查询",
+    "default": true,
+    "hint": "米游社风控严重时可以先关掉（只查森空岛系），过段时间再打开"
+  },
+  "mihoyo_device_mode": {
+    "type": "string",
+    "description": "米游社设备模式",
+    "default": "auto",
+    "options": ["auto", "fp", "gs"],
+    "labels": ["auto（推荐，带重试）", "fp（始终带完整设备头）", "gs（最小指纹，排障用）"],
+    "hint": "遇到 5003 / 1034 等风控 retcode 时，先试 auto，仍然失败再看日志里的链路探针提示"
+  },
+  "mihoyo_task_scope": {
+    "type": "string",
+    "description": "米游社完成度口径",
+    "default": "daily",
+    "options": ["daily", "full"],
+    "labels": ["daily（只看每日委托等判定项）", "full（树脂/派遣/周积分也算）"],
+    "hint": "daily 时树脂、派遣等资源数据只展示不判定，避免「树脂没花完」被当成日常没做"
+  },
+  "proxy": {
+    "type": "string",
+    "description": "米游社请求代理",
+    "default": "",
+    "hint": "例如 http://127.0.0.1:7890；留空直连（会沿用系统 HTTP(S)_PROXY）。注意 getFp 按出口 IP 签发指纹，必须整体走同一出口"
+  },
+  "webhook_enabled": {
+    "type": "bool",
+    "description": "启用 Webhook 推送",
+    "default": false,
+    "hint": "机器人消息之外，再推一份到 Bark / Server酱 / Qmsg / 飞书 / 钉钉"
+  },
+  "webhooks": {
+    "type": "dict",
+    "description": "Webhook 配置",
+    "hint": "只填你想用的通道，留空即跳过",
+    "template_schema": {
+      "bark_key": {
+        "type": "string",
+        "description": "Bark Device Key",
+        "default": ""
+      },
+      "serverchan_key": {
+        "type": "string",
+        "description": "Server酱 SendKey",
+        "default": ""
+      },
+      "qmsg_key": {
+        "type": "string",
+        "description": "Qmsg酱 Key",
+        "default": ""
+      },
+      "feishu_webhook": {
+        "type": "string",
+        "description": "飞书机器人 Webhook",
+        "default": ""
+      },
+      "feishu_secret": {
+        "type": "string",
+        "description": "飞书加签密钥",
+        "default": ""
+      },
+      "dingtalk_webhook": {
+        "type": "string",
+        "description": "钉钉机器人 Webhook",
+        "default": ""
+      },
+      "dingtalk_secret": {
+        "type": "string",
+        "description": "钉钉加签密钥",
+        "default": ""
+      }
+    }
+  }
+}

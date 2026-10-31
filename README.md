@@ -9,6 +9,30 @@
 
 ---
 
+## 两种形态
+
+同一套引擎，两种外壳，按需选一个即可：
+
+| 形态 | 入口 | 适合 |
+|---|---|---|
+| **桌面版**（本文档主体） | `main.py` / `ResinLoop.exe` | 单人、Windows 本机常驻、网页控制台管配置 |
+| **AstrBot 插件版** | [`astrbot_plugin_resinloop/`](astrbot_plugin_resinloop/README.md) | 想推到 QQ / 微信 / Telegram 群，或让 AI 直接回答「今天的日常做完没」 |
+
+插件版把 `core/` 原样搬到了 `astrbot_plugin_resinloop/rl/vendor/`（只改了数据目录、相对导入
+与活动日历的账号来源），换掉的只有外壳：
+
+| 桌面版 | 插件版 |
+|---|---|
+| 常驻守护进程 + 系统托盘 | 插件内 30 秒轮询 + 补发窗口 |
+| WebView2 网页控制台 | AstrBot WebUI 配置表单 |
+| 终端 ASCII 二维码 | 二维码 PNG 发到聊天，后台轮询 |
+| 扫码后手填 `config.json` | 自动写回配置并回填 UID / 区服 / 昵称 |
+| Bark 等 5 个推送通道 | 机器人会话（主）+ 同一批 Webhook（可选） |
+
+命令、配置项与安装步骤见子目录 README；桌面版用法继续往下看。
+
+---
+
 ## 更新日志
 
 ### v2.1.2

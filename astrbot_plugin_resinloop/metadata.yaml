@@ -1,0 +1,16 @@
+name: astrbot_plugin_resinloop
+display_name: ResinLoop 日常巡查
+short_desc: 米游社 / 森空岛的每日任务没做完？到点提醒你（只查询，不签到）
+desc: |
+  移植自 ResinLoop（Windows 桌面版日常巡查工具）的 AstrBot 插件。
+
+  支持原神、崩坏：星穹铁道、绝区零（米游社实时便笺）与明日方舟、终末地（森空岛）。
+  到点自动巡检「每日委托 / 每日实训 / 每日活跃度」等判定项，没做完就推一条消息到订阅的
+  群或私聊；顺带支持体力溢出预警（树脂 / 开拓力 / 电量 / 理智）与活动结束提醒，也可以
+  继续对接 Bark、Server酱、Qmsg酱、飞书、钉钉等 Webhook。
+
+  严格只读：不签到、不领奖励、不修改任何游戏数据。
+version: v1.0.0
+author: R3vonutto
+repo: https://github.com/R3vonutto/ResinLoop
+astrbot_version: ">=4.16,<5"

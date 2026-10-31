@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "display_name": "ResinLoop 日常巡查",
+    "short_desc": "米游社 / 森空岛的每日任务没做完？到点提醒你（只查询，不签到）",
+    "desc": "移植自 ResinLoop 的 AstrBot 插件。支持原神、崩坏：星穹铁道、绝区零、明日方舟、终末地；到点巡检日常进度并推送到订阅的群或私聊，支持体力溢出预警与活动结束提醒。严格只读：不签到、不领奖励、不修改游戏数据。"
+  },
+  "config": {
+    "check_times": {
+      "description": "每日检查时间点",
+      "hint": "24 小时制 HH:MM，可填多个"
+    },
+    "push_targets": {
+      "description": "提醒接收会话（UMO）",
+      "hint": "在群里发 /日常 订阅 会自动填入"
+    },
+    "accounts": {
+      "description": "游戏账号",
+      "hint": "推荐用 /日常 登录米游社、/日常 登录森空岛 扫码自动写入"
+    },
+    "resource_thresholds": {
+      "description": "各游戏体力溢出阈值",
+      "hint": "当前值 ≥ 阈值即预警；填 0 表示该游戏关闭预警"
+    },
+    "webhooks": {
+      "description": "Webhook 配置",
+      "hint": "只填你想用的通道，留空即跳过"
+    }
+  },
+  "commands": {
+    "daily": {
+      "description": "游戏日常巡查"
+    }
+  }
+}

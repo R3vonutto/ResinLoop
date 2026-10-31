@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "display_name": "ResinLoop Daily Watch",
+    "short_desc": "Reminds you when Genshin / HSR / ZZZ / Arknights / Endfield dailies are not finished",
+    "desc": "AstrBot port of ResinLoop. Checks daily task progress from Miyoushe (Genshin, Honkai: Star Rail, Zenless Zone Zero) and Skland (Arknights, Endfield), then pushes a reminder to subscribed chats. Includes stamina overflow and ending-activity alerts. Read-only: no check-in, no reward claiming, no game data modification."
+  },
+  "config": {
+    "check_times": {
+      "description": "Daily check time points",
+      "hint": "24-hour HH:MM, multiple values allowed"
+    },
+    "push_targets": {
+      "description": "Reminder target sessions (UMO)",
+      "hint": "Filled automatically by sending /日常 订阅 in a chat"
+    },
+    "accounts": {
+      "description": "Game accounts",
+      "hint": "Prefer the QR login commands; manual entry is only for migration"
+    },
+    "resource_thresholds": {
+      "description": "Per-game stamina overflow thresholds",
+      "hint": "Alert when current >= threshold; 0 disables the alert for that game"
+    },
+    "webhooks": {
+      "description": "Webhook settings",
+      "hint": "Fill only the channels you use; empty channels are skipped"
+    }
+  },
+  "commands": {
+    "daily": {
+      "description": "Daily game watch"
+    }
+  }
+}

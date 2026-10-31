@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.idea/
+.vscode/
+# 插件运行时目录（设备指纹 / 凭证缓存 / 历史 / 二维码），绝不入库
+.data/
+*.log
+
+# 自测产生的临时目录
+.selftest/
