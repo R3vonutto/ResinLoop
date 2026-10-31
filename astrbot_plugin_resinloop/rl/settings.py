@@ -8,8 +8,9 @@ AstrBot 的配置是「WebUI 表单 + dict」，引擎要的是强类型对象�
 from __future__ import annotations
 
 import re
+import secrets
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .vendor import config as engine_config
 from .vendor.config import (
@@ -115,7 +116,14 @@ def parse_thresholds(value: Any) -> Dict[str, int]:
 
 
 def _parse_accounts(value: Any) -> List[AccountConfig]:
-    """template_list → AccountConfig 列表（游戏名不认识的行直接跳过）。"""
+    """template_list → AccountConfig 列表（游戏名不认识的行直接跳过）。
+
+    同一个人可以有多行同一款游戏（两个手机号各一个号），这里的顺序就是
+    存储顺序，查询/展示都按这个顺序走，不会互相覆盖。
+
+    展示名优先取用户起的别名 ``label``：两个号都叫「博士」时，
+    只有别名能把「大号 / 小号」区分开。
+    """
     accounts: List[AccountConfig] = []
     for item in value if isinstance(value, list) else []:
         if not isinstance(item, dict):
@@ -131,7 +139,7 @@ def _parse_accounts(value: Any) -> List[AccountConfig]:
         accounts.append(
             AccountConfig(
                 game=game,
-                nickname=str(item.get("nickname") or "").strip(),
+                nickname=str(item.get("label") or item.get("nickname") or "").strip(),
                 enabled=_as_bool(item.get("enabled", True)),
                 credential=credential,
             )
@@ -329,8 +337,39 @@ def load(config: Any) -> PluginSettings:
 
 
 # --------------------------------------------------------------------------- #
-# 登录回写：把扫码结果写进插件配置（accounts 是 template_list）
+# 登录回写：把扫码结果合并进某个人的账号行
+#
+# 一个人可以有多行同一款游戏（明日方舟和终末地不在同一个手机号上是最常见的
+# 例子）。所以回写不能「按游戏找到那行就覆盖」，必须按**账号身份**判断：
+#
+#   同一个 uid  → 是老号重新登录，就地刷新凭证（Cookie / token 会过期）
+#   新 uid      → 是这个人的第二个号，追加一行
+#
+# 身份（uid）由登录阶段顺带拉取：米游社取 ``fetch_game_roles`` 的 uid，
+# 森空岛取 binding 里的 uid（终末地退化成角色 roleId）。
 # --------------------------------------------------------------------------- #
+
+
+def new_row_id() -> str:
+    """账号行的稳定 id（8 位十六进制）。用于跨重载认出「还是这一行」。"""
+    return secrets.token_hex(4)
+
+
+@dataclass
+class LoginWriteback:
+    """一次扫码写入了什么（给用户回执用）。"""
+
+    added: List[Dict[str, str]] = field(default_factory=list)
+    updated: List[Dict[str, str]] = field(default_factory=list)
+    missing: List[Dict[str, str]] = field(default_factory=list)
+
+    @property
+    def touched(self) -> List[Dict[str, str]]:
+        return self.added + self.updated
+
+    @property
+    def empty(self) -> bool:
+        return not (self.added or self.updated)
 
 
 def _account_rows(config: Any) -> List[Dict[str, Any]]:
@@ -341,65 +380,144 @@ def _account_rows(config: Any) -> List[Dict[str, Any]]:
     return rows
 
 
-def apply_mihoyo_login(config: Any, cookie: str, roles: Dict[str, Dict[str, Any]]) -> List[str]:
-    """把扫码拿到的 Cookie 写进三款米游社游戏，并顺手回填 uid / server / 昵称。
+def _entry(game: str, row: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    data = row or {}
+    return {
+        "game": game,
+        "label": GAME_LABELS.get(game, game),
+        "name": str(data.get("label") or data.get("nickname") or ""),
+    }
+
+
+def _blank_row(game: str, nickname: str = "") -> Dict[str, Any]:
+    return {
+        "__template_key": ACCOUNT_TEMPLATE_KEY,
+        "id": new_row_id(),
+        "game": game,
+        "label": "",
+        "nickname": nickname,
+        "enabled": True,
+    }
+
+
+def _rows_of_game(rows: List[Dict[str, Any]], game: str) -> List[Dict[str, Any]]:
+    return [
+        row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("game") or "").strip().lower() == game
+    ]
+
+
+def find_account_row(
+    rows: List[Dict[str, Any]], game: str, uid: str = ""
+) -> Optional[Dict[str, Any]]:
+    """在账号行里找「同一个号」的那一行。
+
+    * 给了 uid：先按 uid 精确匹配；匹配不到且这款游戏只有一行、且那行还没记
+      uid（老版本写下的占位行），就认领它 —— 这样升级上来的用户不会平白多一行。
+    * 没给 uid（接口没返回身份）：只有这款游戏正好一行时才复用它，
+      多行时宁可新增也不猜，免得把别人的号覆盖掉。
+    """
+    candidates = _rows_of_game(rows, game)
+    if not candidates:
+        return None
+    uid = (uid or "").strip()
+    if uid:
+        for row in candidates:
+            if str(row.get("uid") or "").strip() == uid:
+                return row
+        if len(candidates) == 1 and not str(candidates[0].get("uid") or "").strip():
+            return candidates[0]
+        return None
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def apply_mihoyo_login(
+    config: Any,
+    cookie: str,
+    roles: Dict[str, Dict[str, Any]],
+    games: Optional[List[str]] = None,
+) -> LoginWriteback:
+    """把扫码拿到的 Cookie 合并进米游社三款游戏的账号行。
 
     Args:
-        config: 插件的 AstrBotConfig（会被原地修改，调用方负责 save_config）。
+        config: ``{"accounts": rows}``（会被原地修改，调用方负责落盘）。
         cookie: 完整 Cookie 串。
         roles: ``fetch_game_roles`` 的结果 ``{game: {uid, server, nickname}}``。
+        games: 这次只登哪几款；``None`` 表示三款都试（没角色的自动跳过）。
 
     Returns:
-        实际写入/更新的游戏中文名列表。
+        :class:`LoginWriteback`：新增 / 刷新 / 该账号下没有的角色。
     """
     rows = _account_rows(config)
-    touched: List[str] = []
-    for game in MIHOYO_GAMES:
+    wanted = [game for game in MIHOYO_GAMES if games is None or game in games]
+    result = LoginWriteback()
+    for game in wanted:
         role = roles.get(game) if isinstance(roles, dict) else None
-        target = None
-        for row in rows:
-            if isinstance(row, dict) and str(row.get("game") or "").lower() == game:
-                target = row
-                break
-        # 账号下没有这款游戏的角色：只在原本就勾了这款游戏时保留占位，不新增
-        if role is None and target is None:
+        if not role:
+            # 这个手机号没玩这款游戏：不建占位行，也绝不动别的号的那一行
+            result.missing.append(_entry(game))
             continue
-        if target is None:
-            target = {"__template_key": ACCOUNT_TEMPLATE_KEY, "game": game, "enabled": True}
+        uid = str(role.get("uid") or "").strip()
+        target = find_account_row(rows, game, uid)
+        created = target is None
+        if created:
+            target = _blank_row(game)
             rows.append(target)
         target["cookie"] = cookie
         for key in ("ltuid", "ltoken"):
             target.pop(key, None)
         target.setdefault("enabled", True)
-        if role is not None:
-            if role.get("uid"):
-                target["uid"] = str(role["uid"])
-            if role.get("server"):
-                target["server"] = str(role["server"])
-            if role.get("nickname"):
-                target["nickname"] = str(role["nickname"])
-        touched.append(GAME_LABELS.get(game, game))
-    return touched
+        target.setdefault("id", new_row_id())
+        if uid:
+            target["uid"] = uid
+        if role.get("server"):
+            target["server"] = str(role["server"])
+        if role.get("nickname"):
+            target["nickname"] = str(role["nickname"])
+        (result.added if created else result.updated).append(_entry(game, target))
+    return result
 
 
-def apply_skland_login(config: Any, token: str, games: List[str] | None = None) -> List[str]:
-    """把鹰角通行证 token 写进森空岛两款游戏（缺行则补一行）。"""
+def apply_skland_login(
+    config: Any,
+    token: str,
+    games: Optional[List[str]] = None,
+    roles: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> LoginWriteback:
+    """把鹰角通行证 token 合并进森空岛两款的账号行。
+
+    Args:
+        config: ``{"accounts": rows}``（会被原地修改，调用方负责落盘）。
+        token: 鹰角登录短 token。
+        games: 这次只登哪几款；``None`` 表示两款都试。
+        roles: ``{game: {uid, nickname}}``（登录时从 binding 顺带拉到）。
+            拿不到身份时按「这款游戏只有一行就复用」处理。
+    """
     rows = _account_rows(config)
-    wanted = [game for game in (games or SKLAND_GAMES) if game in SKLAND_GAMES]
-    touched: List[str] = []
+    wanted = [game for game in SKLAND_GAMES if games is None or game in games]
+    result = LoginWriteback()
     for game in wanted:
-        target = None
-        for row in rows:
-            if isinstance(row, dict) and str(row.get("game") or "").lower() == game:
-                target = row
-                break
-        if target is None:
-            target = {"__template_key": ACCOUNT_TEMPLATE_KEY, "game": game, "enabled": True}
+        role = roles.get(game) if isinstance(roles, dict) else None
+        if roles:  # 拉到了身份表：没这款游戏的角色就不建行
+            if not role:
+                result.missing.append(_entry(game))
+                continue
+        uid = str((role or {}).get("uid") or "").strip()
+        target = find_account_row(rows, game, uid)
+        created = target is None
+        if created:
+            target = _blank_row(game)
             rows.append(target)
         target["token"] = token
         target.setdefault("enabled", True)
-        touched.append(GAME_LABELS.get(game, game))
-    return touched
+        target.setdefault("id", new_row_id())
+        if uid:
+            target["uid"] = uid
+        if role and role.get("nickname"):
+            target["nickname"] = str(role["nickname"])
+        (result.added if created else result.updated).append(_entry(game, target))
+    return result
 
 
 def mask_secret(value: str, keep: int = 4) -> str:
@@ -419,11 +537,14 @@ __all__ = [
     "MIHOYO_GAMES",
     "PUSH_SCOPES",
     "SKLAND_GAMES",
+    "LoginWriteback",
     "PluginSettings",
     "apply_mihoyo_login",
     "apply_skland_login",
+    "find_account_row",
     "load",
     "mask_secret",
+    "new_row_id",
     "parse_accounts",
     "parse_check_times",
     "parse_thresholds",

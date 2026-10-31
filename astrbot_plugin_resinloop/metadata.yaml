@@ -8,9 +8,10 @@ desc: |
   到点巡检每日委托等判定项，没做完就推一条；支持体力溢出与活动结束提醒。
 
   多人独立：账号、历史、提醒按「平台 + 发送者」隔离，群里各查各的，提醒默认发私聊。
+  一个人可以绑多个号（同款游戏两个手机号也行），扫码登录时可只登某一款。
 
   只读：不签到、不领奖励、不改任何游戏数据。
-version: v1.1.1
+version: v1.2.0
 author: R3vonutto
 repo: https://github.com/R3vonutto/ResinLoop
 astrbot_version: ">=4.16,<5"

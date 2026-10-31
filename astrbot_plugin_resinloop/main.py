@@ -12,6 +12,10 @@
 ``users.json`` 里。群里 A 绑的号只有 A 能查到，B 随时可以绑自己的、互不覆盖；
 定时检查也是一个一个人跑、各自发各自的，不会把某人的账号状态发到群里。
 
+一人多号：同一个人可以有多个账号行，同一款游戏也能有两行（明日方舟、终末地
+分属两个手机号是常态）。扫码登录时先选游戏，回写按游戏内 UID 认人 ——
+同一个号再扫是刷新凭证，换成另一个号才新增一行。
+
 严格只读：不签到、不领奖励、不碰任何游戏数据。
 """
 
@@ -19,8 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
@@ -73,6 +78,9 @@ SUB_ACTIONS = {
     "解绑": "unbind",
     "删除绑定": "unbind",
     "unbind": "unbind",
+    "别名": "alias",
+    "改名": "alias",
+    "alias": "alias",
     "认领": "claim",
     "claim": "claim",
     "登录米游社": "login_mihoyo",
@@ -104,6 +112,55 @@ GAME_ALIASES = {
     "终末地": "endfield",
     "endfield": "endfield",
 }
+
+#: 「登录米游社 / 登录森空岛」各自能选哪些游戏（也是选单的编号顺序）
+LOGIN_GAMES: Dict[str, Tuple[str, ...]] = {
+    "login_mihoyo": settings_mod.MIHOYO_GAMES,
+    "login_skland": settings_mod.SKLAND_GAMES,
+}
+
+#: 选单里的「全部」写法
+ALL_TOKENS = {"全部", "所有", "全", "all", "*"}
+
+
+def _game_from_text(text: str) -> str:
+    """中文名 / 英文标识 → 游戏 id；认不出来返回空串。"""
+    key = (text or "").strip().replace(" ", "")
+    if not key:
+        return ""
+    return GAME_ALIASES.get(key) or GAME_ALIASES.get(key.lower()) or (
+        key if key in GAME_LABELS else ""
+    )
+
+
+def _parse_login_selection(arg: str, candidates: Sequence[str]) -> Optional[List[str]]:
+    """解析「登录森空岛 2,1」这种选择，返回要登的游戏列表。
+
+    支持三种写法：编号（1 起的序号，最后一个是「全部」）、游戏名、全部。
+    解析不了返回 ``None``，调用方改成回一张选单。
+    """
+    tokens = [item for item in re.split(r"[\s,，、/+]+", (arg or "").strip()) if item]
+    if not tokens:
+        return None
+    picked: List[str] = []
+    for token in tokens:
+        if token.lower() in ALL_TOKENS or token in ALL_TOKENS:
+            return list(candidates)
+        if token.isdigit():
+            index = int(token)
+            if 1 <= index <= len(candidates):
+                game = candidates[index - 1]
+            elif index == len(candidates) + 1:  # 选单最后一项是「全部」
+                return list(candidates)
+            else:
+                return None
+        else:
+            game = _game_from_text(token)
+            if not game or game not in candidates:
+                return None
+        if game not in picked:
+            picked.append(game)
+    return picked or None
 
 
 def _command_tail(message: str) -> str:
@@ -142,8 +199,8 @@ def _resolve_action(tail: str) -> Tuple[Optional[str], str]:
 @register(
     PLUGIN_NAME,
     "R3vonutto / AstrBot 适配",
-    "游戏日常巡查：米游社 / 森空岛日常未完成提醒（只查询，不签到；每人独立绑定）",
-    "1.1.0",
+    "游戏日常巡查：米游社 / 森空岛日常未完成提醒（只查询，不签到；每人独立绑定，可绑多个号）",
+    "1.2.0",
     "https://github.com/R3vonutto/ResinLoop",
 )
 class ResinLoopPlugin(Star):
@@ -368,12 +425,16 @@ class ResinLoopPlugin(Star):
             yield event.plain_result(self._handle_unbind(event, arg))
             return
 
+        if action == "alias":
+            yield event.plain_result(self._handle_alias(event, arg))
+            return
+
         if action == "claim":
             yield event.plain_result(self._handle_claim(event))
             return
 
         if action in ("login_mihoyo", "login_skland"):
-            async for item in self._handle_login(event, action):
+            async for item in self._handle_login(event, action, arg):
                 yield item
             return
 
@@ -654,36 +715,80 @@ class ResinLoopPlugin(Star):
         return f"已退订当前会话，{tail}"
 
     def _handle_unbind(self, event: AstrMessageEvent, arg: str) -> str:
+        """解绑：按编号删一个号，按游戏名删该游戏的全部号，或「全部」清空。"""
         profile = self._profile(event)
-        if not profile.accounts:
+        entries = profile.entries
+        if not entries:
             return "你还没有绑定任何账号。"
+
         if not arg:
-            bound = "、".join(
-                GAME_LABELS.get(item.game, item.game) for item in profile.accounts
-            )
-            return (
-                f"要解绑哪个游戏？你当前绑定：{bound}\n"
-                "例：/日常 解绑 原神\n"
-                "要全部删除请明确发：/日常 解绑 全部"
-            )
+            lines = ["要解绑哪个？当前绑定："]
+            lines.extend(texts.account_lines(entries))
+            lines.append("发 /日常 解绑 2（编号），或 /日常 解绑 全部")
+            return "\n".join(lines)
 
         wanted = arg.strip().replace(" ", "")
-        if wanted in ("全部", "所有", "all"):
-            game = ""
-        else:
-            game = GAME_ALIASES.get(wanted) or (
-                wanted if wanted in GAME_LABELS else ""
+        if wanted in ALL_TOKENS:
+            removed = self._store.unbind(profile.key, "")
+            logger.info("%s 解绑全部：%s", profile.key, removed)
+            return texts.unbind_text(removed, 0)
+
+        if wanted.isdigit():
+            index = int(wanted)
+            entry = next((item for item in entries if item.index == index), None)
+            if entry is None:
+                return f"没有编号 {index} 的账号。发 /日常 状态 看编号。"
+            removed = self._store.unbind_row(profile.key, entry.row_id)
+            remain = len(self._store.profile(profile.key).entries)
+            logger.info("%s 解绑 #%d %s：%s", profile.key, index, entry.name, removed)
+            return texts.unbind_text([removed] if removed else [], remain)
+
+        game = _game_from_text(wanted)
+        if not game:
+            return (
+                f"不认识「{arg}」。可以发编号（/日常 解绑 2）、"
+                "游戏名（/日常 解绑 明日方舟）或「全部」。"
             )
-            if not game:
-                return (
-                    f"不认识「{arg}」。可用的写法："
-                    + "、".join(GAME_LABELS.values())
-                    + "，或「全部」"
-                )
-        removed = self._store.unbind(profile.key, game)
-        remain = len(self._store.profile(profile.key).accounts)
-        logger.info("%s 解绑 %s：%s", profile.key, game or "全部", removed)
-        return texts.unbind_text(removed, remain)
+
+        same = [item for item in entries if item.game == game]
+        if not same:
+            return f"没有绑定 {GAME_LABELS.get(game, game)}。"
+        if len(same) > 1:
+            # 同名多个号：只说游戏名分不清，让用户按编号指定
+            lines = [f"{GAME_LABELS.get(game, game)} 有 {len(same)} 个号，删哪个？"]
+            lines.extend(texts.account_lines(same))
+            lines.append("发 /日常 解绑 编号")
+            return "\n".join(lines)
+
+        removed = self._store.unbind_row(profile.key, same[0].row_id)
+        remain = len(self._store.profile(profile.key).entries)
+        logger.info("%s 解绑 %s：%s", profile.key, game, removed)
+        return texts.unbind_text([removed] if removed else [], remain)
+
+    def _handle_alias(self, event: AstrMessageEvent, arg: str) -> str:
+        """给账号起别名：``/日常 别名 2 小号``，同款游戏两个号时靠它区分。"""
+        profile = self._profile(event)
+        entries = profile.entries
+        if not entries:
+            return "你还没有绑定任何账号。"
+
+        parts = (arg or "").strip().split(None, 1)
+        entry = None
+        if parts and parts[0].isdigit():
+            index = int(parts[0])
+            entry = next((item for item in entries if item.index == index), None)
+        if entry is None:
+            lines = ["要给哪个账号起名？当前绑定："]
+            lines.extend(texts.account_lines(entries))
+            lines.append("发 /日常 别名 2 小号（只发编号 = 清除别名）")
+            return "\n".join(lines)
+
+        label = parts[1].strip() if len(parts) > 1 else ""
+        name = self._store.set_label(profile.key, entry.row_id, label)
+        if name is None:
+            return "没找到这条账号，发 /日常 状态 看一下编号。"
+        logger.info("%s 账号 #%d 改名：%r", profile.key, entry.index, label)
+        return texts.alias_text(name, label)
 
     def _handle_claim(self, event: AstrMessageEvent) -> str:
         """把旧版「全局配置账号」并到管理员名下，然后清空配置。"""
@@ -719,9 +824,21 @@ class ResinLoopPlugin(Star):
     # 扫码登录（每人各自的会话）
     # ------------------------------------------------------------------ #
 
-    async def _handle_login(self, event: AstrMessageEvent, action: str):
+    async def _handle_login(self, event: AstrMessageEvent, action: str, arg: str = ""):
+        """扫码登录：先选游戏（不带参数就回一张选单），再出二维码。
+
+        选游戏只影响「凭证写到哪几行」，扫码用的账号由手机决定 ——
+        同一个通行证下没玩过的游戏会被跳过，不会平白多一行。
+        """
         profile = self._profile(event)
         key = profile.key
+        kind = "mihoyo" if action == "login_mihoyo" else "skland"
+        candidates = list(LOGIN_GAMES[action])
+
+        selected = _parse_login_selection(arg, candidates)
+        if selected is None:
+            yield event.plain_result(texts.login_menu_text(kind, candidates, profile))
+            return
 
         if key in self._login_sessions:
             yield event.plain_result("已有扫码会话在等待，先完成或等 3 分钟超时。")
@@ -734,10 +851,9 @@ class ResinLoopPlugin(Star):
             )
             return
 
-        kind = "mihoyo" if action == "login_mihoyo" else "skland"
         begin = login.begin_mihoyo if kind == "mihoyo" else login.begin_skland
         try:
-            session = await begin(userstore.file_stem(key)[-10:])
+            session = await begin(userstore.file_stem(key)[-10:], selected)
         except login.LoginError as exc:
             yield event.plain_result(f"❌ {exc}")
             return
@@ -753,6 +869,9 @@ class ResinLoopPlugin(Star):
             chain.append(Plain("二维码图片生成失败，链接：\n"))
             chain.append(Plain(session.url))
         tail = f"\n{session.hint()}，3 分钟内有效。"
+        if len(selected) < len(candidates):
+            names = "、".join(GAME_LABELS.get(game, game) for game in selected)
+            tail += f"\n只写入：{names}"
         chain.append(Plain(tail))
         yield event.chain_result(chain)
 
@@ -765,22 +884,35 @@ class ResinLoopPlugin(Star):
         task.add_done_callback(self._login_tasks.discard)
 
     async def _await_login(self, session: login.QrSession, key: str, umo: str) -> None:
-        """后台等扫码结果，完成后写进这个用户自己的账号表。"""
+        """后台等扫码结果，合并进这个用户自己的账号表。
+
+        同一个号（uid 相同）再扫一次是刷新凭证，另一个号则新增一行；
+        一个人因此可以同时挂两个手机号的明日方舟 / 终末地。
+        """
         from astrbot.api.event import MessageChain
 
+        games = list(session.games) or None
         try:
             if session.kind == "mihoyo":
                 payload = await login.finish_mihoyo(session)
                 rows = self._store.login_rows(key)
-                games = settings_mod.apply_mihoyo_login(
-                    {"accounts": rows}, payload["cookie"], payload.get("roles") or {}
+                result = settings_mod.apply_mihoyo_login(
+                    {"accounts": rows},
+                    payload["cookie"],
+                    payload.get("roles") or {},
+                    games,
                 )
             else:
                 payload = await login.finish_skland(session)
                 rows = self._store.login_rows(key)
-                games = settings_mod.apply_skland_login({"accounts": rows}, payload["token"])
+                result = settings_mod.apply_skland_login(
+                    {"accounts": rows},
+                    payload["token"],
+                    games,
+                    payload.get("roles") or None,
+                )
             self._store.save_login_rows(key)
-            text = texts.login_done_text(session.kind, games)
+            text = texts.login_done_text(session.kind, result)
         except login.LoginError as exc:
             text = f"❌ 登录失败：{exc}"
         except asyncio.CancelledError:

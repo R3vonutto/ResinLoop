@@ -27,10 +27,13 @@ def help_text(settings: PluginSettings, *, bound: bool = False) -> str:
         f"{prefix} 活动 即将结束的活动",
         f"{prefix} 登录米游社 原神 / 崩铁 / 绝区零",
         f"{prefix} 登录森空岛 明日方舟 / 终末地",
+        f"{prefix} 别名 2 小号 给账号起名",
+        f"{prefix} 解绑 2 删掉 2 号账号（「全部」清空）",
         f"{prefix} 订阅 本会话接收提醒",
         f"{prefix} 退订 取消本会话提醒",
-        f"{prefix} 解绑 原神 删除绑定（「全部」清空）",
         f"{prefix} 测试推送 推一条到我的提醒",
+        "",
+        "一个游戏可以绑多个号：再登一次就行。",
     ]
     return "\n".join(lines)
 
@@ -54,10 +57,15 @@ def status_text(
     else:
         lines.append("📋 ResinLoop 状态")
 
-    accounts = list(getattr(profile, "accounts", []) or []) if profile is not None else list(settings.accounts)
-    if not accounts:
+    entries = list(getattr(profile, "entries", []) or []) if profile is not None else []
+    if profile is not None and not entries:
         lines.append("账号：还没绑定（/日常 登录米游社）")
+    elif entries:
+        enabled = sum(1 for item in entries if item.enabled)
+        lines.append(f"账号 {enabled}/{len(entries)}：")
+        lines.extend(account_lines(entries, with_uid=True))
     else:
+        accounts = list(settings.accounts)
         enabled = [item for item in accounts if item.enabled]
         lines.append(f"账号 {len(enabled)}/{len(accounts)}：")
         for account in accounts:
@@ -65,7 +73,7 @@ def status_text(
             label = GAME_LABELS.get(account.game, account.game)
             who = account.nickname or "未命名"
             uid = str((account.credential or {}).get("uid") or "")
-            lines.append(f"  {mark} {label} {who}" + (f" UID {uid}" if uid else ""))
+            lines.append(f"  {mark} {label}（{who}）" + (f" UID {uid}" if uid else ""))
 
     lines.append("")
     if profile is not None:
@@ -87,7 +95,7 @@ def status_text(
     alert_parts: List[str] = []
     if settings.resource_alert_enabled:
         # 只列自己绑了的游戏，避免五行阈值全是别人的事
-        mine = {item.game for item in accounts} or set()
+        mine = {item.game for item in (entries or settings.accounts)} or set()
         for game in ("genshin", "starrail", "zzz", "arknights", "endfield"):
             if mine and game not in mine:
                 continue
@@ -95,6 +103,39 @@ def status_text(
             if threshold > 0:
                 alert_parts.append(f"{GAME_LABELS[game]}≥{threshold}")
     lines.append("体力预警：" + ("、".join(alert_parts) if alert_parts else "关闭"))
+    return "\n".join(lines)
+
+
+def account_lines(entries: List[Any], *, with_uid: bool = False) -> List[str]:
+    """账号清单：带编号（解绑/起别名要用），同名两个号靠别名区分。"""
+    lines: List[str] = []
+    for entry in entries:
+        mark = "✓" if entry.enabled else "✗"
+        text = f"  {entry.index} {mark} {entry.name}"
+        if with_uid and entry.uid:
+            text += f" UID {entry.uid}"
+        lines.append(text)
+    return lines
+
+
+def login_menu_text(
+    kind: str, candidates: List[str], profile: Any = None
+) -> str:
+    """扫码前先选游戏：一次只登一款，还是全登。"""
+    title = "米游社" if kind == "mihoyo" else "森空岛"
+    lines = [f"扫码登录{title}，先选登哪款："]
+    for index, game in enumerate(candidates, start=1):
+        lines.append(f"{index} {GAME_LABELS.get(game, game)}")
+    lines.append(f"{len(candidates) + 1} 全部（{len(candidates)} 个）")
+    lines.append("")
+    lines.append(f"发 /日常 登录{title} 2")
+    lines.append("一个游戏可以绑多个号：换个手机号再扫一次就多一个。")
+
+    entries = list(getattr(profile, "entries", []) or []) if profile is not None else []
+    mine = [item for item in entries if item.game in candidates]
+    if mine:
+        lines.append("")
+        lines.append("已绑定：" + "、".join(item.name for item in mine))
     return "\n".join(lines)
 
 
@@ -281,9 +322,35 @@ def activity_text(settings: PluginSettings, limit: int = 12) -> str:
     return "\n".join(lines)
 
 
-def login_done_text(kind: str, games: List[str], extra: str = "") -> str:
-    game_text = "、".join(games) if games else "无可写入的账号"
-    return f"✅ 登录成功：{game_text}"
+def login_done_text(kind: str, result: Any, extra: str = "") -> str:
+    """登录回执：新增了哪个号、刷新了哪个号、这个号下没有哪款游戏。"""
+    def name(item: Dict[str, str]) -> str:
+        who = str(item.get("name") or "")
+        label = str(item.get("label") or item.get("game") or "")
+        return f"{label}（{who}）" if who else label
+
+    added = [name(item) for item in getattr(result, "added", []) or []]
+    updated = [name(item) for item in getattr(result, "updated", []) or []]
+    missing = [name(item) for item in getattr(result, "missing", []) or []]
+    touched = added + updated
+
+    if len(touched) == 1 and not missing:
+        return f"✅ 登录成功：{touched[0]}"
+
+    lines = ["✅ 登录成功" if touched else "⚠️ 登录成功，但没有写入账号"]
+    if added:
+        lines.append("新增：" + "、".join(added))
+    if updated:
+        lines.append("刷新：" + "、".join(updated))
+    if missing:
+        lines.append("这个号下没有：" + "、".join(missing))
+    return "\n".join(lines)
+
+
+def alias_text(name: str, label: str) -> str:
+    if not label:
+        return f"已清除别名：{name}"
+    return f"已改名：{name}"
 
 
 def cred_alert_text(alerts: List[Dict[str, Any]]) -> str:
@@ -295,7 +362,9 @@ def cred_alert_text(alerts: List[Dict[str, Any]]) -> str:
 
 
 __all__ = [
+    "account_lines",
     "activity_text",
+    "alias_text",
     "binding_hint",
     "cache_note",
     "claim_text",
@@ -303,6 +372,7 @@ __all__ = [
     "cred_alert_text",
     "help_text",
     "login_done_text",
+    "login_menu_text",
     "push_text",
     "report_text",
     "status_text",

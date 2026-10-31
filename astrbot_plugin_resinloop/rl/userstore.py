@@ -6,7 +6,7 @@
 这里把「谁的账号」从插件配置里搬出来，落到插件数据目录的 ``users.json``：
 
     {
-      "version": 1,
+      "version": 2,
       "users": {
         "aiocqhttp:123456": {
           "platform": "aiocqhttp",
@@ -26,6 +26,9 @@
 * **账号行沿用 template_list 的结构**，这样 ``settings.parse_accounts`` 与
   ``apply_mihoyo_login`` / ``apply_skland_login`` 这些已有的回写逻辑可以原样复用，
   不必为「存文件」再写一套字段映射。
+* **一个游戏允许多行**（v2 起）：同一款游戏两个号（两个手机号）是常态，
+  每行用 ``id`` 区分、用 ``label`` 起名，查询时各自查各自的。
+  老数据（v1，一游戏一行、没有 id）读出来时自动补 id，不需要手动迁移。
 * **原子写**：先写 ``.tmp`` 再 ``os.replace``，进程被杀也不会留半截 JSON。
 * **整文件读写 + 进程内 RLock**：单个机器人进程内不会有并发写，
   文件量级（几十个用户）也不值得上数据库。
@@ -53,11 +56,11 @@ from .vendor.config import AccountConfig
 
 logger = logging.getLogger("astrbot_plugin_resinloop.userstore")
 
-STORE_VERSION = 1
+STORE_VERSION = 2
 STORE_NAME = "users.json"
 
-#: 一个用户最多绑多少个游戏（五款游戏 + 余量，防止有人用接口灌垃圾）
-MAX_ACCOUNTS_PER_USER = 12
+#: 一个用户最多绑多少个账号行（五款游戏各两个号 + 余量，防止有人用接口灌垃圾）
+MAX_ACCOUNTS_PER_USER = 20
 
 
 def user_key(platform: str, sender_id: str) -> str:
@@ -82,6 +85,70 @@ def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def normalize_rows(rows: Any) -> List[Dict[str, Any]]:
+    """清洗账号行：丢掉非字典 / 不认识游戏的行，补齐稳定 id 与空字段。
+
+    v1 的数据是「一游戏一行、没有 id」，读出来走这一遍就升级成 v2 结构；
+    重复的 id（手工改文件造成的）也会在这里换掉，保证「按 id 删一行」不会误伤。
+    """
+    cleaned: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in rows if isinstance(rows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        game = str(item.get("game") or "").strip().lower()
+        if game not in GAME_LABELS:
+            continue
+        row = dict(item)
+        row["game"] = game
+        row_id = str(row.get("id") or "").strip()
+        if not row_id or row_id in seen:
+            row_id = settings_mod.new_row_id()
+            while row_id in seen:
+                row_id = settings_mod.new_row_id()
+        row["id"] = row_id
+        row["label"] = str(row.get("label") or "").strip()
+        row["nickname"] = str(row.get("nickname") or "").strip()
+        row["enabled"] = bool(item.get("enabled", True))
+        seen.add(row_id)
+        cleaned.append(row)
+    return cleaned
+
+
+def _entry_name(row: Dict[str, Any]) -> str:
+    """``原神（小号）`` 这种一句话写法；没有名字就只给游戏名。"""
+    game = str(row.get("game") or "")
+    label = GAME_LABELS.get(game, game)
+    who = str(row.get("label") or row.get("nickname") or "").strip()
+    return f"{label}（{who}）" if who else label
+
+
+@dataclass
+class AccountEntry:
+    """账号行的「给人看」视图：编号 + 名字，用于列表 / 解绑 / 起别名。"""
+
+    index: int
+    row_id: str
+    row: Dict[str, Any]
+    game: str
+    label: str
+    nickname: str
+    enabled: bool
+    uid: str
+
+    @property
+    def game_label(self) -> str:
+        return GAME_LABELS.get(self.game, self.game)
+
+    @property
+    def display(self) -> str:
+        return self.label or self.nickname
+
+    @property
+    def name(self) -> str:
+        return _entry_name(self.row)
+
+
 @dataclass
 class UserProfile:
     """一个用户的绑定情况（只读视图，改数据要走 UserStore）。"""
@@ -100,6 +167,23 @@ class UserProfile:
     @property
     def accounts(self) -> List[AccountConfig]:
         return settings_mod.parse_accounts(self.rows)
+
+    @property
+    def entries(self) -> List[AccountEntry]:
+        """按存储顺序编号的账号列表（编号从 1 开始，给用户解绑/起别名用）。"""
+        return [
+            AccountEntry(
+                index=index,
+                row_id=str(row.get("id") or ""),
+                row=row,
+                game=str(row.get("game") or ""),
+                label=str(row.get("label") or ""),
+                nickname=str(row.get("nickname") or ""),
+                enabled=bool(row.get("enabled", True)),
+                uid=str(row.get("uid") or ""),
+            )
+            for index, row in enumerate(self.rows, start=1)
+        ]
 
     @property
     def enabled_accounts(self) -> List[AccountConfig]:
@@ -127,15 +211,13 @@ class UserProfile:
                 return row
         return None
 
+    def rows_of(self, game: str) -> List[Dict[str, Any]]:
+        return [
+            row for row in self.rows if str(row.get("game") or "").lower() == game
+        ]
+
     def summary_lines(self) -> List[str]:
-        lines: List[str] = []
-        for account in self.accounts:
-            mark = "✓" if account.enabled else "✗"
-            label = GAME_LABELS.get(account.game, account.game)
-            who = account.nickname or "未命名"
-            uid = str((account.credential or {}).get("uid") or "")
-            lines.append(f"  {mark} {label}｜{who}" + (f"（UID {uid}）" if uid else ""))
-        return lines
+        return [f"  {entry.index} {entry.name}" for entry in self.entries]
 
 
 class UserStore:
@@ -177,7 +259,26 @@ class UserStore:
             except OSError:
                 pass
         self._data = data
+        self._migrate()
         return data
+
+    def _migrate(self) -> None:
+        """把读进来的老结构就地升级（v1 没 id、可能夹着脏行）。"""
+        data = self._data
+        if not data:
+            return
+        changed = str(data.get("version") or "") != str(STORE_VERSION)
+        data["version"] = STORE_VERSION
+        for user_row in (data.get("users") or {}).values():
+            if not isinstance(user_row, dict):
+                continue
+            current = user_row.get("accounts")
+            cleaned = normalize_rows(current)
+            if cleaned != current:
+                user_row["accounts"] = cleaned
+                changed = True
+        if changed:
+            self._flush()
 
     def _flush(self) -> None:
         data = self._data or self._empty()
@@ -219,7 +320,7 @@ class UserStore:
             platform=str(row.get("platform") or ""),
             sender_id=str(row.get("sender_id") or ""),
             name=str(row.get("name") or ""),
-            rows=accounts if isinstance(accounts, list) else [],
+            rows=normalize_rows(accounts),
             targets=[str(item) for item in targets] if isinstance(targets, list) else [],
             private_umo=str(row.get("private_umo") or ""),
             last_check=str(row.get("last_check") or ""),
@@ -305,7 +406,7 @@ class UserStore:
         with self._lock:
             row = self._row(key, create=True)
             assert row is not None
-            row["accounts"] = rows[:MAX_ACCOUNTS_PER_USER]
+            row["accounts"] = normalize_rows(rows)[:MAX_ACCOUNTS_PER_USER]
             row["updated_at"] = _now_text()
             self._flush()
 
@@ -313,52 +414,87 @@ class UserStore:
         """取一个可原地修改的账号行列表，交给 apply_*_login 回写。
 
         返回的是存储里的真实列表对象：``settings.apply_mihoyo_login`` 会就地改它，
-        改完调用 :meth:`save_login_rows` 落盘即可。
+        改完调用 :meth:`save_login_rows` 落盘即可。返回前先洗一遍，保证每行都有 id。
         """
         with self._lock:
             row = self._row(key, create=True)
             assert row is not None
-            rows = row.get("accounts")
-            if not isinstance(rows, list):
-                rows = []
-                row["accounts"] = rows
+            rows = normalize_rows(row.get("accounts"))
+            row["accounts"] = rows
             return rows
 
     def save_login_rows(self, key: str) -> None:
         with self._lock:
             row = self._row(key)
             if row is not None:
+                row["accounts"] = normalize_rows(row.get("accounts"))[
+                    :MAX_ACCOUNTS_PER_USER
+                ]
                 row["updated_at"] = _now_text()
                 self._flush()
 
     def unbind(self, key: str, game: str = "") -> List[str]:
-        """解绑单个游戏（``game`` 为空则清空全部），返回被移除的中文游戏名。"""
+        """解绑某个游戏的全部账号（``game`` 为空则清空全部），返回被移除的展示名。
+
+        同一款游戏有两个号时，「解绑 明日方舟」会把两个都删掉；
+        只想删一个请用 :meth:`unbind_row`（`/日常 解绑 2`）。
+        """
         with self._lock:
             row = self._row(key)
             removed: List[str] = []
             if row is None:
                 return removed
-            rows = row.get("accounts")
-            if not isinstance(rows, list):
-                return removed
+            rows = normalize_rows(row.get("accounts"))
             if not game:
                 removed = [
-                    GAME_LABELS.get(str(item.get("game") or ""), str(item.get("game") or ""))
-                    for item in rows
-                    if isinstance(item, dict)
+                    _entry_name(item) for item in rows
                 ]
                 row["accounts"] = []
             else:
                 kept: List[Dict[str, Any]] = []
                 for item in rows:
-                    if isinstance(item, dict) and str(item.get("game") or "").lower() == game:
-                        removed.append(GAME_LABELS.get(game, game))
+                    if str(item.get("game") or "").lower() == game:
+                        removed.append(_entry_name(item))
                     else:
                         kept.append(item)
                 row["accounts"] = kept
             row["updated_at"] = _now_text()
             self._flush()
             return removed
+
+    def unbind_row(self, key: str, row_id: str) -> Optional[str]:
+        """按行 id 删掉一个账号，返回它的展示名（找不到返回 None）。"""
+        with self._lock:
+            row = self._row(key)
+            if row is None or not row_id:
+                return None
+            rows = normalize_rows(row.get("accounts"))
+            kept = [item for item in rows if str(item.get("id")) != row_id]
+            if len(kept) == len(rows):
+                return None
+            removed = next(
+                _entry_name(item) for item in rows if str(item.get("id")) == row_id
+            )
+            row["accounts"] = kept
+            row["updated_at"] = _now_text()
+            self._flush()
+            return removed
+
+    def set_label(self, key: str, row_id: str, label: str) -> Optional[str]:
+        """给某个账号起别名（两个号同名时靠它区分），返回设置后的名字。"""
+        with self._lock:
+            row = self._row(key)
+            if row is None or not row_id:
+                return None
+            rows = normalize_rows(row.get("accounts"))
+            target = next((item for item in rows if str(item.get("id")) == row_id), None)
+            if target is None:
+                return None
+            target["label"] = str(label or "").strip()[:16]
+            row["accounts"] = rows
+            row["updated_at"] = _now_text()
+            self._flush()
+            return _entry_name(target)
 
     def subscribe(self, key: str, umo: str) -> bool:
         """订阅一个会话；返回 True 表示本次是新增。"""
@@ -404,21 +540,25 @@ class UserStore:
         with self._lock:
             row = self._row(key, create=True)
             assert row is not None
-            current = row.get("accounts")
-            if not isinstance(current, list):
-                current = []
-            existing = {str(item.get("game") or "").lower() for item in current if isinstance(item, dict)}
+            current = normalize_rows(row.get("accounts"))
+            existing = {
+                (str(item.get("game") or "").lower(), str(item.get("uid") or ""))
+                for item in current
+            }
             added = 0
             for item in rows:
                 if not isinstance(item, dict):
                     continue
-                game = str(item.get("game") or "").lower()
-                if not game or game in existing:
+                game = str(item.get("game") or "").strip().lower()
+                if game not in GAME_LABELS:
+                    continue
+                uid = str(item.get("uid") or "")
+                if (game, uid) in existing or (game, "") in existing:
                     continue
                 current.append(dict(item))
-                existing.add(game)
+                existing.add((game, uid))
                 added += 1
-            row["accounts"] = current[:MAX_ACCOUNTS_PER_USER]
+            row["accounts"] = normalize_rows(current)[:MAX_ACCOUNTS_PER_USER]
             if targets:
                 merged = list(row.get("targets") or [])
                 for target in targets:
@@ -443,10 +583,12 @@ class UserStore:
 
 
 __all__ = [
+    "AccountEntry",
     "MAX_ACCOUNTS_PER_USER",
     "STORE_NAME",
     "UserProfile",
     "UserStore",
     "file_stem",
+    "normalize_rows",
     "user_key",
 ]

@@ -265,13 +265,40 @@ def test_command_parsing() -> None:
         "状态": ("status", ""),
         "登录米游社": ("login_mihoyo", ""),
         "登录 森空岛": ("login_skland", ""),
+        "登录森空岛 2": ("login_skland", "2"),
+        "别名 2 小号": ("alias", "2 小号"),
         "测试推送": ("test_push", ""),
         "解绑 原神": ("unbind", "原神"),
+        "解绑 2": ("unbind", "2"),
         "不存在": (None, ""),
     }
     for tail, expected in actions.items():
         got = plugin_main._resolve_action(tail)
         check(f"动作 {tail!r} → {expected!r}", got == expected, f"实际 {got!r}")
+
+    # 登录时选游戏：编号 / 游戏名 / 全部都认
+    skland = list(settings_mod.SKLAND_GAMES)
+    mihoyo = list(settings_mod.MIHOYO_GAMES)
+    selections = {
+        "1": ["arknights"],
+        "2": ["endfield"],
+        "1,2": ["arknights", "endfield"],
+        "3": ["arknights", "endfield"],        # 选单最后一项 = 全部
+        "全部": ["arknights", "endfield"],
+        "终末地": ["endfield"],
+        "endfield": ["endfield"],
+        "1 不存在的游戏": None,
+        "9": None,
+        "": None,
+    }
+    for text, expected in selections.items():
+        got = plugin_main._parse_login_selection(text, skland)
+        check(f"选游戏 {text!r} → {expected}", got == expected, f"实际 {got!r}")
+    check(
+        "米游社选单三款",
+        plugin_main._parse_login_selection("4", mihoyo) == mihoyo,
+        str(plugin_main._parse_login_selection("4", mihoyo)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -374,7 +401,7 @@ def test_scheduler() -> None:
 # 4. 登录回写
 # --------------------------------------------------------------------------- #
 def test_login_writeback() -> None:
-    print("\n[5] 扫码结果回写配置")
+    print("\n[5] 扫码结果回写（多人多号）")
     cfg = {"accounts": [{"__template_key": "account", "game": "genshin", "cookie": "old", "uid": "", "server": ""}]}
     written = settings_mod.apply_mihoyo_login(
         cfg,
@@ -388,12 +415,54 @@ def test_login_writeback() -> None:
     check("原神行被更新", rows["genshin"]["cookie"] == "ltuid=1; ltoken=2" and rows["genshin"]["uid"] == "1001")
     check("崩铁行自动补建", "starrail" in rows and rows["starrail"]["uid"] == "2002")
     check("绝区零无角色不新增", "zzz" not in rows)
-    check("回写清单可读", "原神" in written and "崩坏：星穹铁道" in written, str(written))
+    check(
+        "回执分「刷新」和「新增」",
+        [item["label"] for item in written.updated] == ["原神"]
+        and [item["label"] for item in written.added] == ["崩坏：星穹铁道"],
+        str(written),
+    )
+    check("每行都有稳定 id", all(row.get("id") for row in cfg["accounts"]))
 
+    # 同一个号再扫一次：刷原来那行，不新增
+    again = settings_mod.apply_mihoyo_login(
+        cfg, "cookie-new", {"genshin": {"uid": "1001", "nickname": "旅行者"}}
+    )
+    check(
+        "同 uid 再登只刷新",
+        again.added == [] and [item["label"] for item in again.updated] == ["原神"],
+        str(again),
+    )
+    check("凭证已刷新", cfg["accounts"][0]["cookie"] == "cookie-new")
+
+    # 另一个手机号（uid 不同）：追加一个号，旧号不受影响
+    other = settings_mod.apply_mihoyo_login(
+        cfg, "cookie-b", {"genshin": {"uid": "9999", "server": "cn_gf01", "nickname": "小号旅行者"}}
+    )
+    genshin_rows = [row for row in cfg["accounts"] if row["game"] == "genshin"]
+    check("不同 uid 追加一行", len(genshin_rows) == 2, str(len(genshin_rows)))
+    check("新增行带着身份", other.added[0]["name"] == "小号旅行者", str(other.added))
+    check("老号凭证没被覆盖", genshin_rows[0]["cookie"] == "cookie-new")
+
+    # 只登指定的游戏
     cfg2 = {"accounts": []}
-    written2 = settings_mod.apply_skland_login(cfg2, "tok", ["arknights"])
-    check("森空岛行自动补建", cfg2["accounts"][0]["token"] == "tok" and written2 == ["明日方舟"])
-    check("新行带 template_key", cfg2["accounts"][0]["__template_key"] == "account")
+    settings_mod.apply_skland_login(
+        cfg2, "tok", ["endfield"], {"endfield": {"uid": "r1", "nickname": "管理员"}}
+    )
+    check("只写指定的那一款", [row["game"] for row in cfg2["accounts"]] == ["endfield"])
+
+    second = settings_mod.apply_skland_login(
+        cfg2, "tok2", None, {"arknights": {"uid": "u2", "nickname": "博士"}}
+    )
+    check(
+        "只登有角色的那款",
+        [item["label"] for item in second.added] == ["明日方舟"] and second.updated == [],
+        str(second),
+    )
+    check("该号下没玩的游戏不建行", len(cfg2["accounts"]) == 2, str(cfg2["accounts"]))
+    ark_row = next(row for row in cfg2["accounts"] if row["game"] == "arknights")
+    end_row = next(row for row in cfg2["accounts"] if row["game"] == "endfield")
+    check("两条凭证各自独立", ark_row["token"] == "tok2" and end_row["token"] == "tok")
+    check("新行带 template_key", ark_row["__template_key"] == "account")
 
 
 # --------------------------------------------------------------------------- #
@@ -477,7 +546,7 @@ def test_plugin_commands() -> None:
     check("/日常 退订 回执", "已退订当前会话" in results[-1][1], results[-1][1][:60])
 
     # 扫码登录：普通用户也能用（不再限管理员），且会话按人登记
-    async def fake_begin(tag: str = ""):
+    async def fake_begin(tag: str = "", games=()):
         return types.SimpleNamespace(
             kind="mihoyo",
             url="https://example.invalid/qr",
@@ -485,6 +554,7 @@ def test_plugin_commands() -> None:
             ticket="t",
             device_id="dev",
             scan_id="",
+            games=tuple(games or ()),
             hint=lambda: "请用米游社扫码",
         )
 
@@ -497,7 +567,7 @@ def test_plugin_commands() -> None:
     try:
 
         async def login_flow():
-            event = FakeEvent("日常 登录米游社", sender="9", name="乙", umo="aiocqhttp:FriendMessage:9")
+            event = FakeEvent("日常 登录米游社 全部", sender="9", name="乙", umo="aiocqhttp:FriendMessage:9")
             items = [item async for item in plugin.daily(event)]
             await asyncio.sleep(0.05)  # 让后台扫码任务（立即抛错）收尾
             return items
@@ -515,6 +585,18 @@ def test_plugin_commands() -> None:
             str(plugin._store.profile("aiocqhttp:9").rows),
         )
         check("扫码会话已释放", plugin._login_sessions == {}, str(plugin._login_sessions))
+
+        # 不带参数只回选单，不直接出二维码
+        menu = asyncio.run(
+            collect_daily(plugin, FakeEvent("日常 登录米游社", sender="9", name="乙"))
+        )
+        check("登录先给选单", menu[-1][0] == "plain" and "先选登哪款" in menu[-1][1], str(menu)[:120])
+        check(
+            "选单列出三款 + 全部",
+            "1 原神" in menu[-1][1] and "4 全部" in menu[-1][1],
+            menu[-1][1][:160],
+        )
+        check("没选就不建会话", plugin._login_sessions == {}, str(plugin._login_sessions))
     finally:
         plugin_main.login.begin_mihoyo = original_begin
         plugin_main.login.finish_mihoyo = original_finish
@@ -640,7 +722,7 @@ def test_multi_user() -> None:
 
         # 解绑必须指名，避免一句「解绑」把号全删
         results = asyncio.run(run(FakeEvent("日常 解绑", sender="1002", name="乙")))
-        check("解绑不带参数只提示", "要解绑哪个游戏" in results[-1][1], results[-1][1][:60])
+        check("解绑不带参数只提示", "要解绑哪个" in results[-1][1], results[-1][1][:60])
         check(
             "提示后账号没被删",
             [item.game for item in plugin._store.profile("aiocqhttp:1002").accounts] == ["zzz"],
@@ -648,7 +730,11 @@ def test_multi_user() -> None:
 
         # 解绑只影响自己
         removed = plugin._store.unbind("aiocqhttp:1001", "genshin")
-        check("解绑只删自己的原神", removed == ["原神"], str(removed))
+        check(
+            "解绑只删自己的原神",
+            len(removed) == 1 and removed[0].startswith("原神"),
+            str(removed),
+        )
         check("甲已清空", plugin._store.profile("aiocqhttp:1001").accounts == [])
         check("乙毫发无损", [item.game for item in plugin._store.profile("aiocqhttp:1002").accounts] == ["zzz"])
 
@@ -682,8 +768,241 @@ def test_multi_user() -> None:
         settings_mod.PluginSettings.provider = original_provider
 
 
+def test_multi_account_store() -> None:
+    """一个人绑多个号：同款游戏两行、编号、别名、按条解绑、老数据升级。"""
+    print("\n[8] 一人多号（存储层）")
+    from rl.userstore import STORE_VERSION, UserStore
+
+    tmp = PLUGIN_DIR / ".selftest" / "store_test.json"
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.unlink(missing_ok=True)
+
+    # v1 老数据（一行一个游戏、没有 id）：读出来自动补 id 并升到 v2
+    tmp.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "users": {
+                    "aiocqhttp:1": {
+                        "accounts": [
+                            {"game": "arknights", "token": "a", "nickname": "博士"},
+                            {"game": "endfield", "token": "b", "nickname": "管理员"},
+                        ]
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    store = UserStore(tmp)
+    upgraded = store.profile("aiocqhttp:1")
+    check("老数据自动补 id", all(item.row_id for item in upgraded.entries))
+    check("老数据互不重号", len({item.row_id for item in upgraded.entries}) == 2)
+    saved = json.loads(tmp.read_text(encoding="utf-8"))
+    check("存储版本升到 v2", saved.get("version") == STORE_VERSION, str(saved.get("version")))
+
+    # 两个号的明日方舟
+    store.set_accounts(
+        "aiocqhttp:2",
+        [
+            {"game": "arknights", "token": "a1", "nickname": "博士", "uid": "u1"},
+            {"game": "arknights", "token": "a2", "nickname": "博士", "uid": "u2"},
+        ],
+    )
+    profile = store.profile("aiocqhttp:2")
+    check("同款游戏可以两行", len(profile.entries) == 2, str(len(profile.entries)))
+    check("编号从 1 开始", [item.index for item in profile.entries] == [1, 2])
+    check(
+        "两个号都会进查询列表",
+        [item.game for item in profile.accounts] == ["arknights", "arknights"],
+    )
+
+    store.set_label("aiocqhttp:2", profile.entries[1].row_id, "小号")
+    profile = store.profile("aiocqhttp:2")
+    check("别名可设置", profile.entries[1].label == "小号")
+    check("展示名优先用别名", profile.accounts[1].nickname == "小号", profile.accounts[1].nickname)
+    check("列表里能看出是两个号", "小号" in profile.entries[1].name)
+
+    removed = store.unbind_row("aiocqhttp:2", profile.entries[0].row_id)
+    check("按编号只删一条", bool(removed) and removed.startswith("明日方舟"), str(removed))
+    left = store.profile("aiocqhttp:2")
+    check("另一个号还在", len(left.entries) == 1 and left.entries[0].label == "小号")
+
+    # 按游戏名解绑 = 删掉该游戏的全部行，别的游戏不受影响
+    store.set_accounts(
+        "aiocqhttp:3",
+        [
+            {"game": "genshin", "cookie": "c1", "uid": "1"},
+            {"game": "genshin", "cookie": "c2", "uid": "2"},
+            {"game": "starrail", "cookie": "c3", "uid": "3"},
+        ],
+    )
+    removed_all = store.unbind("aiocqhttp:3", "genshin")
+    check("按游戏解绑删光这一款", len(removed_all) == 2, str(removed_all))
+    check(
+        "别的游戏不受影响",
+        [item.game for item in store.profile("aiocqhttp:3").entries] == ["starrail"],
+    )
+
+
+def test_multi_account_commands() -> None:
+    """指令层：状态页带编号、报告里同款游戏分行、别名、按编号解绑。"""
+    print("\n[9] 一人多号（指令层）")
+    cfg = dict(SAMPLE_CONFIG)
+    cfg["accounts"] = []
+    cfg["push_targets"] = []
+    cfg["command_cooldown_seconds"] = 0
+    cfg["query_cache_seconds"] = 0
+    plugin = plugin_main.ResinLoopPlugin(plugin_main.Context(), cfg)
+
+    original_provider = settings_mod.PluginSettings.provider
+    settings_mod.PluginSettings.provider = property(lambda self: "mock")
+    try:
+        key = "aiocqhttp:3001"
+        plugin._store.set_accounts(
+            key,
+            [
+                {"game": "arknights", "token": "t1", "nickname": "博士", "uid": "u1"},
+                {"game": "arknights", "token": "t2", "nickname": "博士", "uid": "u2"},
+                {"game": "endfield", "token": "t3", "nickname": "管理员", "uid": "u3"},
+            ],
+        )
+
+        def run(message: str) -> str:
+            event = FakeEvent(message, sender="3001", name="丙")
+            items = asyncio.run(collect_daily(plugin, event))
+            return "".join(item[1] for item in items if item[0] == "plain")
+
+        status = run("日常 状态")
+        check("状态页账号数按行算", "账号 3/3" in status, status[:120])
+        check("状态页列出编号", "1 ✓" in status and "3 ✓" in status, status[:200])
+
+        body = run("日常")
+        check("同款游戏在报告里出现两次", body.count("明日方舟") >= 2, body[:200])
+
+        check("别名写入成功", "已改名" in run("日常 别名 2 小号"))
+        check(
+            "别名落到第二行",
+            plugin._store.profile(key).entries[1].label == "小号",
+            str(plugin._store.profile(key).rows),
+        )
+        check("别名出现在报告里", "小号" in run("日常"), run("日常")[:200])
+
+        out = run("日常 解绑 2")
+        check("按编号解绑成功", "已解绑" in out, out[:80])
+        check("只删掉编号那一条", len(plugin._store.profile(key).entries) == 2)
+
+        # 同款游戏两个号时，只说游戏名分不清，要求按编号
+        plugin._store.set_accounts(
+            key,
+            [
+                {"game": "arknights", "token": "x1", "nickname": "博士"},
+                {"game": "arknights", "token": "x2", "nickname": "博士"},
+            ],
+        )
+        out = run("日常 解绑 明日方舟")
+        check("同款两个号要求按编号", "2 个号" in out, out[:120])
+        check("提示时没动数据", len(plugin._store.profile(key).entries) == 2)
+
+        out = run("日常 解绑 全部")
+        check("「全部」清空", plugin._store.profile(key).entries == [] and "已清空" in out, out[:80])
+    finally:
+        settings_mod.PluginSettings.provider = original_provider
+
+
+def test_login_flow_success() -> None:
+    """用户场景：明日方舟和终末地不在一个手机号上 —— 分两次扫码，各写各的。"""
+    print("\n[10] 扫码登录全流程（两个手机号）")
+    cfg = dict(SAMPLE_CONFIG)
+    cfg["accounts"] = []
+    cfg["push_targets"] = []
+    context = plugin_main.Context()
+    plugin = plugin_main.ResinLoopPlugin(context, cfg)
+
+    async def fake_begin(tag: str = "", games=()):
+        return types.SimpleNamespace(
+            kind="skland",
+            url="https://example.invalid/qr",
+            png=None,
+            ticket="",
+            device_id="",
+            scan_id="scan",
+            games=tuple(games or ()),
+            hint=lambda: "请用森空岛扫码",
+        )
+
+    seq = [
+        {"token": "tokA", "roles": {"arknights": {"uid": "uA", "nickname": "博士A"}}},
+        {"token": "tokB", "roles": {"endfield": {"uid": "rB", "nickname": "管理员B"}}},
+        # 第三次：老号 A 重新扫码（同一个 uid，换了 token）
+        {"token": "tokA2", "roles": {"arknights": {"uid": "uA", "nickname": "博士A"}}},
+    ]
+
+    async def fake_finish(session, timeout: int = 180):
+        return seq.pop(0)
+
+    original_begin, original_finish = (
+        plugin_main.login.begin_skland,
+        plugin_main.login.finish_skland,
+    )
+    plugin_main.login.begin_skland = fake_begin
+    plugin_main.login.finish_skland = fake_finish
+    try:
+
+        def login(message: str) -> list:
+            async def flow():
+                items = [
+                    item async for item in plugin.daily(FakeEvent(message, sender="4001", name="丁"))
+                ]
+                await asyncio.sleep(0.05)  # 等后台扫码任务收尾
+                return items
+
+            return asyncio.run(flow())
+
+        key = "aiocqhttp:4001"
+        login("日常 登录森空岛 1")  # 手机号 A：只登明日方舟
+        rows = plugin._store.profile(key).rows
+        check("第一次扫码只写明日方舟", [row["game"] for row in rows] == ["arknights"], str(rows))
+        check(
+            "回执说明登录成功",
+            any("登录成功" in text and "明日方舟" in text for _, text in context.sent),
+            str(context.sent),
+        )
+
+        login("日常 登录森空岛 2")  # 手机号 B：只登终末地
+        rows = plugin._store.profile(key).rows
+        check(
+            "第二次扫码追加终末地，不覆盖方舟",
+            [row["game"] for row in rows] == ["arknights", "endfield"],
+            str([row.get("game") for row in rows]),
+        )
+        tokens = {row["game"]: row["token"] for row in rows}
+        check("两个号各自用自己的凭证", tokens == {"arknights": "tokA", "endfield": "tokB"}, str(tokens))
+
+        login("日常 登录森空岛 1")  # 手机号 A 再扫一次：刷新，不该多一行
+        rows = plugin._store.profile(key).rows
+        check("同号重扫不新增", len(rows) == 2, str(len(rows)))
+        check(
+            "同号重扫刷新凭证",
+            next(row for row in rows if row["game"] == "arknights")["token"] == "tokA2",
+        )
+
+        # 报告里两个号都在
+        body = "".join(
+            item[1]
+            for item in login("日常 状态")
+            if item[0] == "plain"
+        )
+        check("状态页看得到两个号", "账号 2/2" in body and "终末地" in body, body[:160])
+        check("登录会话已释放", plugin._login_sessions == {}, str(plugin._login_sessions))
+    finally:
+        plugin_main.login.begin_skland = original_begin
+        plugin_main.login.finish_skland = original_finish
+
+
 def test_credentials_and_history() -> None:
-    print("\n[8] 凭证解析 / 凭证记账 / 周报")
+    print("\n[11] 凭证解析 / 凭证记账 / 周报")
     from rl.vendor import history
     from rl.vendor.mihoyo_api import extract_credentials
 
@@ -750,7 +1069,7 @@ def TaskItemSimple(name: str, done: bool, progress: str = ""):
 
 
 def test_schema() -> None:
-    print("\n[9] 元数据与配置 schema")
+    print("\n[12] 元数据与配置 schema")
     schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
     meta_keys = list(schema)
     for expected in ("enabled", "check_times", "push_targets", "accounts", "resource_thresholds", "webhooks"):
@@ -774,8 +1093,11 @@ def main() -> int:
     test_scheduler()
     test_login_writeback()
     test_plugin_commands()
-    test_credentials_and_history()
     test_multi_user()
+    test_multi_account_store()
+    test_multi_account_commands()
+    test_login_flow_success()
+    test_credentials_and_history()
     test_schema()
 
     print("\n" + "=" * 52)
