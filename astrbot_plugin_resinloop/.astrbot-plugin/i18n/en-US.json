@@ -2,7 +2,7 @@
   "metadata": {
     "display_name": "ResinLoop Daily Watch",
     "short_desc": "Reminds you when Genshin / HSR / ZZZ / Arknights / Endfield dailies are not finished",
-    "desc": "AstrBot port of ResinLoop. Checks daily task progress from Miyoushe (Genshin, Honkai: Star Rail, Zenless Zone Zero) and Skland (Arknights, Endfield), then pushes a reminder to subscribed chats. Includes stamina overflow and ending-activity alerts. Read-only: no check-in, no reward claiming, no game data modification."
+    "desc": "AstrBot plugin ported from ResinLoop. Daily-check tracking for Genshin Impact, Honkai: Star Rail, Zenless Zone Zero, Arknights and Endfield. Accounts are isolated per user (platform + sender), so every member binds and queries their own. Read-only: no check-in, no rewards, no data changes."
   },
   "config": {
     "check_times": {
@@ -10,12 +10,12 @@
       "hint": "24-hour HH:MM, multiple values allowed"
     },
     "push_targets": {
-      "description": "Reminder target sessions (UMO)",
-      "hint": "Filled automatically by sending /日常 订阅 in a chat"
+      "description": "Legacy global push targets (deprecated)",
+      "hint": "Per-user subscriptions replaced this; only used by /daily claim"
     },
     "accounts": {
-      "description": "Game accounts",
-      "hint": "Prefer the QR login commands; manual entry is only for migration"
+      "description": "Legacy global accounts (deprecated)",
+      "hint": "Each user binds their own via /daily login; this is only for migrating old configs"
     },
     "resource_thresholds": {
       "description": "Per-game stamina overflow thresholds",
@@ -24,6 +24,22 @@
     "webhooks": {
       "description": "Webhook settings",
       "hint": "Fill only the channels you use; empty channels are skipped"
+    },
+    "push_scope": {
+      "description": "Where scheduled alerts go",
+      "hint": "private_first: private chat if known, so group members never see each other's accounts"
+    },
+    "query_cache_seconds": {
+      "description": "Per-user query cache (seconds)",
+      "hint": "0 disables"
+    },
+    "command_cooldown_seconds": {
+      "description": "Per-user cooldown between checks (seconds)",
+      "hint": "0 disables"
+    },
+    "max_login_sessions": {
+      "description": "Max concurrent QR login sessions",
+      "hint": "Keeps multiple users from blocking each other"
     }
   },
   "commands": {

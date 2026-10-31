@@ -14,8 +14,10 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+from . import user_history
 from .settings import PluginSettings
 from .vendor import activities, cred_health, history, mihoyo_api
 from .vendor.analyzer import DailyReport, build_report
@@ -200,8 +202,17 @@ def _collect_activity_alerts(app_config: AppConfig) -> List[Any]:
         return []
 
 
-def run_check_sync(settings: PluginSettings, *, dry_run: bool = False) -> RunResult:
-    """跑一轮检查（阻塞）。没有可查账号时返回空报告，由调用方给提示。"""
+def run_check_sync(
+    settings: PluginSettings,
+    *,
+    dry_run: bool = False,
+    history_path: Optional[Path] = None,
+) -> RunResult:
+    """跑一轮检查（阻塞）。没有可查账号时返回空报告，由调用方给提示。
+
+    ``history_path`` 给定时，本轮的完成记录写进这个文件（一人一份存档），
+    为空则沿用引擎默认的全局文件。
+    """
     started = time.monotonic()
     app_config = settings.to_app_config()
     apply_query_globals(app_config)
@@ -223,7 +234,8 @@ def run_check_sync(settings: PluginSettings, *, dry_run: bool = False) -> RunRes
 
     if not dry_run:
         try:
-            history.record(report)
+            with user_history.scoped(history_path):
+                history.record(report)
         except Exception as exc:  # noqa: BLE001 - 存档失败不能影响主流程
             logger.warning("写入历史记录失败（不影响本轮检查）：%s", exc)
 
@@ -246,15 +258,23 @@ def run_check_sync(settings: PluginSettings, *, dry_run: bool = False) -> RunRes
     )
 
 
-async def run_check(settings: PluginSettings, *, dry_run: bool = False) -> RunResult:
+async def run_check(
+    settings: PluginSettings,
+    *,
+    dry_run: bool = False,
+    history_path: Optional[Path] = None,
+) -> RunResult:
     """异步入口：阻塞逻辑丢线程池，事件循环不被 HTTP 请求卡住。"""
-    return await asyncio.to_thread(run_check_sync, settings, dry_run=dry_run)
+    return await asyncio.to_thread(
+        run_check_sync, settings, dry_run=dry_run, history_path=history_path
+    )
 
 
-def weekly_digest(days: int = 7) -> Dict[str, Any]:
-    """最近 N 天完成情况（用于「周报」指令）。"""
+def weekly_digest(days: int = 7, path: Optional[Path] = None) -> Dict[str, Any]:
+    """最近 N 天完成情况（用于「周报」指令）。``path`` 指定某个人的存档。"""
     try:
-        return history.weekly_digest(days)
+        with user_history.scoped(path):
+            return history.weekly_digest(days)
     except Exception as exc:  # noqa: BLE001
         logger.warning("读取历史失败：%s", exc)
         return {}

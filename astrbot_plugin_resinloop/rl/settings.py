@@ -8,7 +8,7 @@ AstrBot 的配置是「WebUI 表单 + dict」，引擎要的是强类型对象�
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List
 
 from .vendor import config as engine_config
@@ -38,6 +38,10 @@ MIHOYO_GAMES = ("genshin", "starrail", "zzz")
 SKLAND_GAMES = ("arknights", "endfield")
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+#: 定时提醒的投递范围（多人同群时决定「发给谁」）
+PUSH_SCOPES = ("private_first", "session_only", "private_only")
+
 
 DEFAULT_THRESHOLDS: Dict[str, int] = dict(engine_config.RESOURCE_THRESHOLD_DEFAULT)
 
@@ -135,9 +139,17 @@ def _parse_accounts(value: Any) -> List[AccountConfig]:
     return accounts
 
 
+#: 公开别名：userstore 用同一套解析，保证「存下来的行」与「配置里的行」口径一致
+parse_accounts = _parse_accounts
+
+
 @dataclass
 class PluginSettings:
-    """一次快照的插件设置（每次用到都从 self.config 重新解析，改了配置立即生效）。"""
+    """一次快照的插件设置（每次用到都从 self.config 重新解析，改了配置立即生效）。
+
+    ``accounts`` 在这里只表示「这一轮查谁」：多用户模式下由 :meth:`for_accounts`
+    注入某个人的账号；插件配置里那份降级成遗留数据（用 ``/日常 认领`` 迁移）。
+    """
 
     enabled: bool = True
     check_times: List[str] = field(default_factory=lambda: ["08:30", "20:30"])
@@ -145,6 +157,15 @@ class PluginSettings:
     push_targets: List[str] = field(default_factory=list)
     always_notify: bool = False
     test_mode: str = "auto"
+
+    #: 定时提醒发到哪：private_first（私聊优先，群内不串号）/ session_only / private_only
+    push_scope: str = "private_first"
+    #: 同一个人重复查询的缓存秒数（0 关闭）：群里连着问几次不会重复打接口
+    query_cache_seconds: int = 90
+    #: 同一个人两次 /日常 之间的最小间隔（0 关闭）
+    command_cooldown_seconds: int = 10
+    #: 同时进行的扫码会话上限（多人各自扫码时互不阻塞）
+    max_login_sessions: int = 3
 
     resource_alert_enabled: bool = True
     thresholds: Dict[str, int] = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
@@ -159,6 +180,10 @@ class PluginSettings:
     accounts: List[AccountConfig] = field(default_factory=list)
     webhooks: Dict[str, str] = field(default_factory=dict)
     webhook_enabled: bool = False
+
+    def for_accounts(self, accounts: List[AccountConfig]) -> "PluginSettings":
+        """派生出「只看这个人的账号」的配置快照。"""
+        return replace(self, accounts=list(accounts or []))
 
     @property
     def enabled_accounts(self) -> List[AccountConfig]:
@@ -272,6 +297,10 @@ def load(config: Any) -> PluginSettings:
 
     webhooks_raw = raw.get("webhooks") if isinstance(raw.get("webhooks"), dict) else {}
 
+    push_scope = str(raw.get("push_scope") or "private_first").strip().lower()
+    if push_scope not in PUSH_SCOPES:
+        push_scope = "private_first"
+
     return PluginSettings(
         enabled=_as_bool(raw.get("enabled"), True),
         check_times=parse_check_times(raw.get("check_times")) or ["08:30", "20:30"],
@@ -279,6 +308,12 @@ def load(config: Any) -> PluginSettings:
         push_targets=[item for item in _as_list(raw.get("push_targets")) if ":" in item],
         always_notify=_as_bool(raw.get("always_notify"), False),
         test_mode=test_mode,
+        push_scope=push_scope,
+        query_cache_seconds=_as_int(raw.get("query_cache_seconds"), 90, low=0, high=3600),
+        command_cooldown_seconds=_as_int(
+            raw.get("command_cooldown_seconds"), 10, low=0, high=600
+        ),
+        max_login_sessions=_as_int(raw.get("max_login_sessions"), 3, low=1, high=10),
         resource_alert_enabled=_as_bool(raw.get("resource_alert_enabled"), True),
         thresholds=parse_thresholds(raw.get("resource_thresholds")),
         activity_alert_enabled=_as_bool(raw.get("activity_alert_enabled"), True),
@@ -382,12 +417,14 @@ __all__ = [
     "GAME_LABELS",
     "GAME_ORDER",
     "MIHOYO_GAMES",
+    "PUSH_SCOPES",
     "SKLAND_GAMES",
     "PluginSettings",
     "apply_mihoyo_login",
     "apply_skland_login",
     "load",
     "mask_secret",
+    "parse_accounts",
     "parse_check_times",
     "parse_thresholds",
 ]

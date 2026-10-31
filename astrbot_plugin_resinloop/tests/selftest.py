@@ -170,8 +170,9 @@ def _install_astrbot_stub() -> None:
 _install_astrbot_stub()
 
 import main as plugin_main  # noqa: E402
+from rl import runner  # noqa: E402
 from rl import settings as settings_mod  # noqa: E402
-from rl import texts  # noqa: E402
+from rl import texts, user_history  # noqa: E402
 from rl.runner import collect_statuses  # noqa: E402
 from rl.scheduler import CheckScheduler, next_run_at  # noqa: E402
 from rl.vendor.analyzer import build_report  # noqa: E402
@@ -260,12 +261,13 @@ def test_command_parsing() -> None:
         check(f"{message!r} → {expected!r}", got == expected, f"实际 {got!r}")
 
     actions = {
-        "": "check",
-        "状态": "status",
-        "登录米游社": "login_mihoyo",
-        "登录 森空岛": "login_skland",
-        "测试推送": "test_push",
-        "不存在": None,
+        "": ("check", ""),
+        "状态": ("status", ""),
+        "登录米游社": ("login_mihoyo", ""),
+        "登录 森空岛": ("login_skland", ""),
+        "测试推送": ("test_push", ""),
+        "解绑 原神": ("unbind", "原神"),
+        "不存在": (None, ""),
     }
     for tail, expected in actions.items():
         got = plugin_main._resolve_action(tail)
@@ -398,13 +400,39 @@ def test_login_writeback() -> None:
 # 5. 插件类：命令走通
 # --------------------------------------------------------------------------- #
 class FakeEvent:
-    def __init__(self, message: str, *, admin: bool = True, umo: str = "aiocqhttp:private:1"):
+    """最小事件桩：插件只用到这几个接口。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        admin: bool = False,
+        umo: str = "aiocqhttp:FriendMessage:1",
+        sender: str = "1",
+        platform: str = "aiocqhttp",
+        name: str = "小明",
+    ):
         self.message_str = message
         self.unified_msg_origin = umo
         self._admin = admin
+        self._sender = sender
+        self._platform = platform
+        self._name = name
 
     def is_admin(self) -> bool:
         return self._admin
+
+    def get_platform_name(self) -> str:
+        return self._platform
+
+    def get_sender_id(self) -> str:
+        return self._sender
+
+    def get_sender_name(self) -> str:
+        return self._name
+
+    def is_private_chat(self) -> bool:
+        return "FriendMessage" in self.unified_msg_origin
 
     def plain_result(self, text: str):
         return ("plain", text)
@@ -415,8 +443,9 @@ class FakeEvent:
 
 def test_plugin_commands() -> None:
     print("\n[6] 插件命令")
-    cfg = settings_mod.load({}) if False else dict(SAMPLE_CONFIG)
+    cfg = dict(SAMPLE_CONFIG)
     cfg["accounts"] = []  # 不绑定账号：避免真去请求米游社
+    cfg["push_targets"] = []
     context = plugin_main.Context()
     plugin = plugin_main.ResinLoopPlugin(context, cfg)
 
@@ -427,42 +456,234 @@ def test_plugin_commands() -> None:
     check("/日常 无账号时给出绑定指引", "登录米游社" in results[-1][1], str(results)[:120])
 
     results = asyncio.run(collect(FakeEvent("日常 状态")))
-    check("/日常 状态 有输出", "ResinLoop 状态" in results[-1][1])
+    check("/日常 状态 有输出", "我的状态" in results[-1][1], results[-1][1][:60])
 
     results = asyncio.run(collect(FakeEvent("日常 帮助")))
-    check("/日常 帮助 列出子命令", "登录森空岛" in results[-1][1])
+    check("/日常 帮助 列出子命令", "登录森空岛" in results[-1][1] and "解绑" in results[-1][1])
 
-    results = asyncio.run(collect(FakeEvent("日常 订阅", admin=True)))
-    check("/日常 订阅 写入 push_targets", "aiocqhttp:private:1" in plugin.config["push_targets"])
-    check("/日常 订阅 回执含会话数", "提醒接收方" in results[-1][1])
+    # 订阅：普通用户即可，写进自己的条目而不是插件配置
+    group = FakeEvent("日常 订阅", umo="aiocqhttp:GroupMessage:555", sender="1")
+    results = asyncio.run(collect(group))
+    profile = plugin._store.profile("aiocqhttp:1")
+    check("/日常 订阅 写进本人订阅", profile.targets == ["aiocqhttp:GroupMessage:555"], str(profile.targets))
+    check("/日常 订阅 回执含会话数", "提醒列表" in results[-1][1], results[-1][1][:60])
+    check("/日常 订阅 不再污染全局配置", plugin.config["push_targets"] == [])
 
-    results = asyncio.run(collect(FakeEvent("日常 退订", admin=True)))
-    check(
-        "/日常 退订 只移除本会话",
-        plugin.config["push_targets"] == ["aiocqhttp:group:123456"],
-        str(plugin.config["push_targets"]),
-    )
+    results = asyncio.run(collect(group))
+    check("重复订阅提示已存在", "已经在你的提醒列表" in results[-1][1])
 
-    results = asyncio.run(collect(FakeEvent("日常 订阅", admin=False)))
-    check("非管理员不能订阅", "管理员" in results[-1][1])
+    results = asyncio.run(collect(FakeEvent("日常 退订", umo="aiocqhttp:GroupMessage:555", sender="1")))
+    check("/日常 退订 清空本人订阅", plugin._store.profile("aiocqhttp:1").targets == [])
+    check("/日常 退订 回执", "已退订当前会话" in results[-1][1], results[-1][1][:60])
 
-    results = asyncio.run(collect(FakeEvent("日常 登录米游社", admin=False)))
-    check("非管理员不能扫码登录", "管理员" in results[-1][1])
+    # 扫码登录：普通用户也能用（不再限管理员），且会话按人登记
+    async def fake_begin(tag: str = ""):
+        return types.SimpleNamespace(
+            kind="mihoyo",
+            url="https://example.invalid/qr",
+            png=None,
+            ticket="t",
+            device_id="dev",
+            scan_id="",
+            hint=lambda: "请用米游社扫码",
+        )
+
+    async def fake_finish(session, timeout: int = 180):
+        raise plugin_main.login.LoginError("离线自测不真的扫码")
+
+    original_begin, original_finish = plugin_main.login.begin_mihoyo, plugin_main.login.finish_mihoyo
+    plugin_main.login.begin_mihoyo = fake_begin
+    plugin_main.login.finish_mihoyo = fake_finish
+    try:
+
+        async def login_flow():
+            event = FakeEvent("日常 登录米游社", sender="9", name="乙", umo="aiocqhttp:FriendMessage:9")
+            items = [item async for item in plugin.daily(event)]
+            await asyncio.sleep(0.05)  # 让后台扫码任务（立即抛错）收尾
+            return items
+
+        results = asyncio.run(login_flow())
+        check("登录不再要求管理员", results[-1][0] == "chain", str(results)[:80])
+        check(
+            "登录结果回传给发起者",
+            any("登录失败" in text for umo, text in context.sent),
+            str(context.sent)[:120],
+        )
+        check(
+            "别的用户没被写入",
+            plugin._store.profile("aiocqhttp:9").accounts == [],
+            str(plugin._store.profile("aiocqhttp:9").rows),
+        )
+        check("扫码会话已释放", plugin._login_sessions == {}, str(plugin._login_sessions))
+    finally:
+        plugin_main.login.begin_mihoyo = original_begin
+        plugin_main.login.finish_mihoyo = original_finish
 
     # 有账号但走 mock：直接验证 runner 的报告渲染路径
     cfg2 = dict(SAMPLE_CONFIG)
     plugin2 = plugin_main.ResinLoopPlugin(plugin_main.Context(), cfg2)
     settings2 = plugin2._settings()
-    check("插件能解析出账号", len(settings2.accounts) == 2)
+    check("插件能解析出遗留账号", len(settings2.accounts) == 2)
 
     ok_sched = plugin2._settings().enabled
     check("插件未启动调度时 running=False", plugin2._scheduler.running is False)
     check("enabled 默认开启", ok_sched)
 
 
+async def collect_daily(target_plugin, event) -> list:
+    """把命令产出的消息收成列表（异步推导式必须待在协程里）。"""
+    return [item async for item in target_plugin.daily(event)]
+
+
+def test_multi_user() -> None:
+    """两人各自绑定 → 各查各的、各推各的，互不覆盖。"""
+    print("\n[7] 多人隔离")
+    cfg = dict(SAMPLE_CONFIG)
+    cfg["accounts"] = []
+    cfg["push_targets"] = []
+    cfg["always_notify"] = True   # 保证定时检查一定会推，便于验证「推给谁」
+    cfg["query_cache_seconds"] = 90
+    cfg["command_cooldown_seconds"] = 0
+    context = plugin_main.Context()
+    plugin = plugin_main.ResinLoopPlugin(context, cfg)
+
+    # 用 mock 数据源：真数据源要联网，这里只验证「按人分流」
+    original_provider = settings_mod.PluginSettings.provider
+    settings_mod.PluginSettings.provider = property(lambda self: "mock")
+    try:
+        plugin._store.set_accounts(
+            "aiocqhttp:1001",
+            [{"game": "genshin", "nickname": "甲的原神", "enabled": True, "cookie": "ltuid=1"}],
+        )
+        plugin._store.set_accounts(
+            "aiocqhttp:1002",
+            [{"game": "zzz", "nickname": "乙的绝区零", "enabled": True, "cookie": "ltuid=2"}],
+        )
+        a = plugin._store.profile("aiocqhttp:1001")
+        b = plugin._store.profile("aiocqhttp:1002")
+        check("甲的账号只属于甲", [item.game for item in a.accounts] == ["genshin"])
+        check("乙的账号只属于乙", [item.game for item in b.accounts] == ["zzz"])
+
+        async def run(event) -> list:
+            return [item async for item in plugin.daily(event)]
+
+        ev_a = FakeEvent("日常", sender="1001", name="甲", umo="aiocqhttp:FriendMessage:1001")
+        ev_b = FakeEvent("日常", sender="1002", name="乙", umo="aiocqhttp:FriendMessage:1002")
+        ra = asyncio.run(run(ev_a))
+        rb = asyncio.run(run(ev_b))
+        text_a = "".join(item[1] for item in ra if item[0] == "plain")
+        text_b = "".join(item[1] for item in rb if item[0] == "plain")
+        check("甲只看到自己的原神", "原神" in text_a and "绝区零" not in text_a, text_a[:120])
+        check("乙只看到自己的绝区零", "绝区零" in text_b and "原神" not in text_b, text_b[:120])
+        check("两份结果不同", text_a != text_b)
+
+        # 缓存只命中自己：紧接着再查一次，不该串到对方
+        ra2 = asyncio.run(run(ev_a))
+        check("甲的第二次查询命中自己的缓存", "缓存" in "".join(i[1] for i in ra2), str(ra2)[:120])
+
+        # 历史存档一人一份
+        path_a = user_history.path_for("aiocqhttp:1001")
+        path_b = user_history.path_for("aiocqhttp:1002")
+        check("甲的存档单独落盘", path_a.exists(), str(path_a))
+        check("乙的存档单独落盘", path_b.exists(), str(path_b))
+        check("两份存档不是同一个文件", path_a != path_b)
+
+        digest_a = runner.weekly_digest(7, path_a)
+        digest_b = runner.weekly_digest(7, path_b)
+        games_a = {item.get("game") for item in digest_a.get("games", [])}
+        games_b = {item.get("game") for item in digest_b.get("games", [])}
+        check("甲的周报只有原神", games_a == {"genshin"}, str(games_a))
+        check("乙的周报只有绝区零", games_b == {"zzz"}, str(games_b))
+
+        # 订阅互不影响
+        asyncio.run(run(FakeEvent("日常 订阅", sender="1001", umo="aiocqhttp:GroupMessage:777")))
+        asyncio.run(run(FakeEvent("日常 订阅", sender="1002", umo="aiocqhttp:GroupMessage:888")))
+        check(
+            "订阅按人分开",
+            plugin._store.profile("aiocqhttp:1001").targets == ["aiocqhttp:GroupMessage:777"]
+            and plugin._store.profile("aiocqhttp:1002").targets == ["aiocqhttp:GroupMessage:888"],
+        )
+
+        # 定时检查：一人一条，且都发到各自私聊（群里不串号）
+        context.sent.clear()
+        asyncio.run(plugin._on_slot("08:30", plugin._settings()))
+        sent_umos = [umo for umo, _ in context.sent]
+        check("定时检查每个用户各推一条", len(context.sent) == 2, str(sent_umos))
+        check(
+            "推送落在各自私聊",
+            sorted(sent_umos)
+            == ["aiocqhttp:FriendMessage:1001", "aiocqhttp:FriendMessage:1002"],
+            str(sent_umos),
+        )
+        bodies = {umo: text for umo, text in context.sent}
+        check(
+            "推送内容各不相同",
+            "绝区零" not in bodies.get("aiocqhttp:FriendMessage:1001", "")
+            and "原神" not in bodies.get("aiocqhttp:FriendMessage:1002", ""),
+        )
+
+        # 投递范围可配
+        scope_settings = plugin._settings()
+        profile_b = plugin._store.profile("aiocqhttp:1002")
+        check(
+            "默认私聊优先",
+            plugin._resolve_targets(profile_b, scope_settings) == ["aiocqhttp:FriendMessage:1002"],
+            str(plugin._resolve_targets(profile_b, scope_settings)),
+        )
+        scope_settings.push_scope = "session_only"
+        check(
+            "session_only 走订阅会话",
+            plugin._resolve_targets(profile_b, scope_settings) == ["aiocqhttp:GroupMessage:888"],
+            str(plugin._resolve_targets(profile_b, scope_settings)),
+        )
+        scope_settings.push_scope = "private_first"
+
+        # 解绑必须指名，避免一句「解绑」把号全删
+        results = asyncio.run(run(FakeEvent("日常 解绑", sender="1002", name="乙")))
+        check("解绑不带参数只提示", "要解绑哪个游戏" in results[-1][1], results[-1][1][:60])
+        check(
+            "提示后账号没被删",
+            [item.game for item in plugin._store.profile("aiocqhttp:1002").accounts] == ["zzz"],
+        )
+
+        # 解绑只影响自己
+        removed = plugin._store.unbind("aiocqhttp:1001", "genshin")
+        check("解绑只删自己的原神", removed == ["原神"], str(removed))
+        check("甲已清空", plugin._store.profile("aiocqhttp:1001").accounts == [])
+        check("乙毫发无损", [item.game for item in plugin._store.profile("aiocqhttp:1002").accounts] == ["zzz"])
+
+        # 旧配置账号认领（连同旧历史存档一起迁移）
+        from rl.vendor import history as history_mod
+
+        legacy_file = history_mod.DATA_DIR / "history.json"
+        legacy_file.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file.write_text(json.dumps({"version": 1, "days": {}}), encoding="utf-8")
+
+        cfg_legacy = dict(SAMPLE_CONFIG)
+        plugin_legacy = plugin_main.ResinLoopPlugin(plugin_main.Context(), cfg_legacy)
+        claim_event = FakeEvent("日常 认领", admin=True, sender="2001", name="管理员")
+        results = asyncio.run(collect_daily(plugin_legacy, claim_event))
+        check("认领后配置被清空", plugin_legacy.config["accounts"] == [])
+        claimed = plugin_legacy._store.profile("aiocqhttp:2001")
+        check("旧账号已并入管理员", [item.game for item in claimed.accounts] == ["genshin", "arknights"])
+        check("认领回执可读", "并入你名下" in results[-1][1], results[-1][1][:80])
+        check(
+            "旧历史存档随之迁移",
+            user_history.path_for("aiocqhttp:2001").exists(),
+            str(user_history.path_for("aiocqhttp:2001")),
+        )
+
+        # 普通用户不能认领别人的旧账号
+        results = asyncio.run(
+            collect_daily(plugin_legacy, FakeEvent("日常 认领", admin=False, sender="2002"))
+        )
+        check("非管理员不能认领", "管理员" in results[-1][1], results[-1][1][:60])
+    finally:
+        settings_mod.PluginSettings.provider = original_provider
+
+
 def test_credentials_and_history() -> None:
-    print("\n[7] 凭证解析 / 凭证记账 / 周报")
-    from rl import runner
+    print("\n[8] 凭证解析 / 凭证记账 / 周报")
     from rl.vendor import history
     from rl.vendor.mihoyo_api import extract_credentials
 
@@ -518,7 +739,7 @@ def test_credentials_and_history() -> None:
         scheduler_running=True,
     )
     check("状态文案含账号与下次时间", "原神" in status_text and "11-01 08:30" in status_text)
-    check("状态文案用人话说数据源", "米游社 + 森空岛" in status_text, status_text[-60:])
+    check("状态文案含体力预警口径", "体力预警：原神≥180" in status_text, status_text[-80:])
     check("活动文案能离线兜底", "活动" in texts.activity_text(settings_mod.load({})))
 
 
@@ -529,7 +750,7 @@ def TaskItemSimple(name: str, done: bool, progress: str = ""):
 
 
 def test_schema() -> None:
-    print("\n[8] 元数据与配置 schema")
+    print("\n[9] 元数据与配置 schema")
     schema = json.loads((PLUGIN_DIR / "_conf_schema.json").read_text(encoding="utf-8"))
     meta_keys = list(schema)
     for expected in ("enabled", "check_times", "push_targets", "accounts", "resource_thresholds", "webhooks"):
@@ -554,6 +775,7 @@ def main() -> int:
     test_login_writeback()
     test_plugin_commands()
     test_credentials_and_history()
+    test_multi_user()
     test_schema()
 
     print("\n" + "=" * 52)

@@ -8,6 +8,10 @@
     判断  「每日委托 / 每日实训 / 每日活跃度」等判定项是否做完，顺带算体力溢出预警
     提醒  到点检查 → 主动发消息到订阅的群/私聊，也可继续用 Bark 等 Webhook
 
+多人隔离（本版重点）：账号、历史存档、提醒订阅全部按「平台 + 发送者」分开存在
+``users.json`` 里。群里 A 绑的号只有 A 能查到，B 随时可以绑自己的、互不覆盖；
+定时检查也是一个一个人跑、各自发各自的，不会把某人的账号状态发到群里。
+
 严格只读：不签到、不领奖励、不碰任何游戏数据。
 """
 
@@ -15,27 +19,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, register
 
 try:  # 正常情况：插件作为 data.plugins.<name> 子包加载
-    from .rl import data_dir, login, pusher, runner, texts
+    from .rl import data_dir, login, pusher, runner, texts, userstore
     from .rl import settings as settings_mod
+    from .rl import user_history
     from .rl.scheduler import CheckScheduler, next_run_at
-    from .rl.settings import PluginSettings
+    from .rl.settings import GAME_LABELS, PluginSettings
     from .rl.vendor.notifier import should_push
 except ImportError:  # 少数加载方式下 main 是顶层模块，包上下文不存在
     import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from rl import data_dir, login, pusher, runner, texts
+    from rl import data_dir, login, pusher, runner, texts, userstore
     from rl import settings as settings_mod
+    from rl import user_history
     from rl.scheduler import CheckScheduler, next_run_at
-    from rl.settings import PluginSettings
+    from rl.settings import GAME_LABELS, PluginSettings
     from rl.vendor.notifier import should_push
 
 logger = logging.getLogger("astrbot_plugin_resinloop")
@@ -63,6 +70,11 @@ SUB_ACTIONS = {
     "退订": "unsubscribe",
     "取消订阅": "unsubscribe",
     "unsubscribe": "unsubscribe",
+    "解绑": "unbind",
+    "删除绑定": "unbind",
+    "unbind": "unbind",
+    "认领": "claim",
+    "claim": "claim",
     "登录米游社": "login_mihoyo",
     "米游社": "login_mihoyo",
     "mihoyo": "login_mihoyo",
@@ -74,6 +86,23 @@ SUB_ACTIONS = {
     "帮助": "help",
     "help": "help",
     "?": "help",
+}
+
+#: 「解绑 xxx」里能认出来的游戏名（中文 / 英文标识都收）
+GAME_ALIASES = {
+    "原神": "genshin",
+    "genshin": "genshin",
+    "星铁": "starrail",
+    "崩铁": "starrail",
+    "崩坏星穹铁道": "starrail",
+    "starrail": "starrail",
+    "绝区零": "zzz",
+    "zzz": "zzz",
+    "明日方舟": "arknights",
+    "方舟": "arknights",
+    "arknights": "arknights",
+    "终末地": "endfield",
+    "endfield": "endfield",
 }
 
 
@@ -93,23 +122,28 @@ def _command_tail(message: str) -> str:
     return " ".join(tokens).strip()
 
 
-def _resolve_action(tail: str) -> Optional[str]:
-    """把子命令文本映射到动作；支持「登录 米游社」这种被空格拆开的情况。"""
+def _resolve_action(tail: str) -> Tuple[Optional[str], str]:
+    """把子命令文本映射到动作，并返回动作后面的参数。"""
     key = (tail or "").strip()
     if not key:
-        return SUB_ACTIONS[""]
-    for candidate in (key, key.replace(" ", ""), key.split()[0]):
+        return SUB_ACTIONS[""], ""
+    # 整段匹配（含「登录米游社」不带空格、「登录 米游社」被空格拆开两种）
+    for candidate in (key, key.replace(" ", "")):
         action = SUB_ACTIONS.get(candidate)
         if action:
-            return action
-    return None
+            return action, ""
+    head = key.split()[0]
+    action = SUB_ACTIONS.get(head)
+    if action:
+        return action, key[len(head):].strip()
+    return None, ""
 
 
 @register(
     PLUGIN_NAME,
     "R3vonutto / AstrBot 适配",
-    "游戏日常巡查：米游社 / 森空岛日常未完成提醒（只查询，不签到）",
-    "1.0.0",
+    "游戏日常巡查：米游社 / 森空岛日常未完成提醒（只查询，不签到；每人独立绑定）",
+    "1.1.0",
     "https://github.com/R3vonutto/ResinLoop",
 )
 class ResinLoopPlugin(Star):
@@ -117,9 +151,13 @@ class ResinLoopPlugin(Star):
         super().__init__(context, config)
         self.config: Any = config if config is not None else {}
         self._run_lock = asyncio.Lock()
-        # 同一时刻只允许一个扫码会话在等（避免两条命令互相覆盖消息）
-        self._login_kind: Optional[str] = None
+        # 每用户一个扫码会话（多人同时扫各自的号，互不排队）
+        self._login_sessions: Dict[str, str] = {}
         self._login_tasks: set[asyncio.Task] = set()
+        # 查询缓存与冷却都按用户键，绝不跨人复用
+        self._cache: Dict[str, Tuple[float, float, Any]] = {}
+        self._cooldown: Dict[str, float] = {}
+        self._store = userstore.UserStore()
         self._scheduler = CheckScheduler(
             get_settings=self._settings_async,
             on_slot=self._on_slot,
@@ -170,14 +208,23 @@ class ResinLoopPlugin(Star):
         except Exception:  # noqa: BLE001
             return ""
 
-    async def _mark_run(self) -> str:
+    @staticmethod
+    def _now_stamp() -> str:
         from datetime import datetime
 
-        stamp = datetime.now().strftime("%m-%d %H:%M")
+        return datetime.now().strftime("%m-%d %H:%M")
+
+    async def _mark_run(self, key: str = "") -> str:
+        stamp = self._now_stamp()
         try:
             await self.put_kv_data(KV_LAST_RUN, stamp)
         except Exception:  # noqa: BLE001
             pass
+        if key:
+            try:
+                self._store.set_last_check(key, stamp)
+            except Exception:  # noqa: BLE001 - 记不上不影响本轮
+                logger.debug("写入个人检查时间失败", exc_info=True)
         return stamp
 
     def _ensure_scheduler(self) -> None:
@@ -190,12 +237,70 @@ class ResinLoopPlugin(Star):
         self._scheduler.start()
 
     # ------------------------------------------------------------------ #
+    # 用户身份
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _platform(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_platform_name() or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _sender(event: AstrMessageEvent) -> str:
+        try:
+            value = str(event.get_sender_id() or "")
+            if value:
+                return value
+        except Exception:  # noqa: BLE001
+            pass
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        return umo.rsplit(":", 1)[-1] if ":" in umo else umo
+
+    @staticmethod
+    def _is_private(event: AstrMessageEvent) -> bool:
+        try:
+            return bool(event.is_private_chat())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _user_key(self, event: AstrMessageEvent) -> str:
+        return userstore.user_key(self._platform(event), self._sender(event))
+
+    def _profile(self, event: AstrMessageEvent):
+        """取（并顺手刷新）当前发送者的绑定资料。
+
+        顺带做两件事：记住昵称用于日志；私聊过一次就记住私聊会话，
+        定时提醒会优先发那里 —— 群里就不会出现别人的账号状态。
+        """
+        key = self._user_key(event)
+        name = ""
+        try:
+            name = str(event.get_sender_name() or "")
+        except Exception:  # noqa: BLE001
+            pass
+        profile = self._store.touch(
+            key,
+            name=name,
+            platform=self._platform(event),
+            sender_id=self._sender(event),
+        )
+        if self._is_private(event):
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            if umo and profile.private_umo != umo:
+                self._store.set_private_umo(key, umo)
+                profile = self._store.profile(key)
+        return profile
+
+    # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self) -> None:
         logger.info("ResinLoop 数据目录：%s", data_dir.ROOT_DIR)
+        logger.info("ResinLoop 用户存储：%s", self._store.path)
         self._ensure_scheduler()
 
     async def terminate(self) -> None:
@@ -204,7 +309,7 @@ class ResinLoopPlugin(Star):
         for task in list(self._login_tasks):
             task.cancel()
         self._login_tasks.clear()
-        self._login_kind = None
+        self._login_sessions.clear()
         logger.info("ResinLoop 插件已卸载")
 
     # ------------------------------------------------------------------ #
@@ -215,8 +320,7 @@ class ResinLoopPlugin(Star):
     async def daily(self, event: AstrMessageEvent):
         """游戏日常巡查：/日常 立即检查，/日常 状态 看概览，/日常 帮助 看全部指令。"""
         self._ensure_scheduler()
-        tail = _command_tail(event.message_str)
-        action = _resolve_action(tail)
+        action, arg = _resolve_action(_command_tail(event.message_str))
         if action is None:
             action = "help"
 
@@ -230,35 +334,42 @@ class ResinLoopPlugin(Star):
             return
 
         if action == "status":
-            settings = self._settings()
-            yield event.plain_result(
-                texts.status_text(
-                    settings,
-                    last_run=await self._last_run(),
-                    next_run=next_run_at(settings),
-                    scheduler_running=self._scheduler.running,
-                )
-            )
+            yield event.plain_result(await self._status_message(event))
             return
 
         if action == "weekly":
-            digest = await asyncio.to_thread(runner.weekly_digest, 7)
-            yield event.plain_result(texts.weekly_text(digest))
+            profile = self._profile(event)
+            digest = await asyncio.to_thread(
+                runner.weekly_digest, 7, user_history.path_for(profile.key)
+            )
+            body = texts.weekly_text(digest)
+            if not profile.has_accounts:
+                body = texts.binding_hint() + "\n\n" + body
+            yield event.plain_result(body)
             return
 
         if action == "activity":
-            text = await asyncio.to_thread(texts.activity_text, self._settings())
+            profile = self._profile(event)
+            text = await asyncio.to_thread(
+                texts.activity_text, self._settings().for_accounts(profile.accounts)
+            )
             yield event.plain_result(text)
             return
 
-        if action in ("subscribe", "unsubscribe"):
-            if not event.is_admin():
-                yield event.plain_result("只有管理员可以修改提醒订阅。")
-                return
-            _, message = self._toggle_subscription(
-                event.unified_msg_origin, action == "subscribe"
-            )
-            yield event.plain_result(message)
+        if action == "subscribe":
+            yield event.plain_result(self._toggle_subscription(event, True))
+            return
+
+        if action == "unsubscribe":
+            yield event.plain_result(self._toggle_subscription(event, False))
+            return
+
+        if action == "unbind":
+            yield event.plain_result(self._handle_unbind(event, arg))
+            return
+
+        if action == "claim":
+            yield event.plain_result(self._handle_claim(event))
             return
 
         if action in ("login_mihoyo", "login_skland"):
@@ -267,9 +378,6 @@ class ResinLoopPlugin(Star):
             return
 
         if action == "test_push":
-            if not event.is_admin():
-                yield event.plain_result("只有管理员可以测试推送。")
-                return
             async for item in self._handle_check(event, force_push=True):
                 yield item
             return
@@ -280,96 +388,322 @@ class ResinLoopPlugin(Star):
 
     async def _handle_check(self, event: AstrMessageEvent, *, force_push: bool = False):
         settings = self._settings()
-        if not settings.ready:
-            yield event.plain_result(
-                "还没有绑定任何游戏账号。\n"
-                "私聊机器人（管理员）发 /日常 登录米游社 或 /日常 登录森空岛 扫码即可。"
-            )
+        profile = self._profile(event)
+        if not profile.has_accounts:
+            yield event.plain_result(texts.binding_hint())
             return
+
+        key = profile.key
+        now = time.monotonic()
+        # 群里多人同时问时，标题要能看出这是谁的结果
+        title = "" if self._is_private(event) else f"{profile.display} 的日常"
+
+        if not force_push:
+            wait = self._cooldown.get(key, 0.0) - now
+            if wait > 0:
+                yield event.plain_result(texts.cooldown_text(round(wait)))
+                return
+
+            cached = self._cache.get(key)
+            if cached and cached[0] > now:
+                age = int(now - cached[1])
+                logger.info("%s 命中缓存（%d 秒前）", key, age)
+                yield event.plain_result(
+                    texts.report_text(cached[2].report, title=title) + texts.cache_note(age)
+                )
+                return
 
         yield event.plain_result("正在查询，稍等…" if not force_push else "正在查询并测试推送…")
 
-        result = await self._run_once(settings, dry_run=False)
-        await self._mark_run()
-        yield event.plain_result(texts.report_text(result.report))
+        user_settings = settings.for_accounts(profile.accounts)
+        result = await self._run_once(
+            user_settings, history_path=user_history.path_for(key), dry_run=False
+        )
+        self._cooldown[key] = time.monotonic() + settings.command_cooldown_seconds
+        if settings.query_cache_seconds > 0:
+            self._cache[key] = (
+                time.monotonic() + settings.query_cache_seconds,
+                time.monotonic(),
+                result,
+            )
+            self._prune_cache()
+
+        await self._mark_run(key)
+        yield event.plain_result(texts.report_text(result.report, title=title))
 
         if force_push:
-            report = await self._deliver(settings, result.report)
-            yield event.plain_result(f"推送结果：{report.summary()}")
+            targets = self._resolve_targets(profile, settings)
+            if not targets:
+                yield event.plain_result(
+                    "你还没有可用的提醒去处：私聊我一次，或在某个会话里发 /日常 订阅。"
+                )
+                return
+            push_title, push_body = result.report.to_push_payload()
+            delivery = await pusher.push_to_sessions(
+                self.context, targets, f"{push_title}\n{push_body}"
+            )
+            yield event.plain_result(f"推送结果：{pusher.DeliveryReport(delivery).summary()}")
         elif result.cred_alerts:
             yield event.plain_result(texts.cred_alert_text(result.cred_alerts))
 
-    async def _run_once(self, settings: PluginSettings, *, dry_run: bool = False):
+    def _prune_cache(self) -> None:
+        """缓存表别无限长，顺手清掉过期的。"""
+        if len(self._cache) < 200:
+            return
+        now = time.monotonic()
+        expired = [key for key, item in self._cache.items() if item[0] <= now]
+        for key in expired:
+            self._cache.pop(key, None)
+        for key, until in list(self._cooldown.items()):
+            if until <= now:
+                self._cooldown.pop(key, None)
+
+    async def _run_once(self, settings: PluginSettings, *, dry_run: bool = False, history_path=None):
         """串行化执行：定时任务和手动检查撞一起时排队，不并发打接口。"""
         async with self._run_lock:
-            return await runner.run_check(settings, dry_run=dry_run)
+            return await runner.run_check(
+                settings, dry_run=dry_run, history_path=history_path
+            )
 
-    async def _deliver(self, settings: PluginSettings, report) -> pusher.DeliveryReport:
-        title, body = report.to_push_payload()
-        return await pusher.deliver(self.context, settings, title, body)
+    # ------------------------------------------------------------------ #
+    # 状态
+    # ------------------------------------------------------------------ #
+
+    async def _status_message(self, event: AstrMessageEvent) -> str:
+        settings = self._settings()
+        profile = self._profile(event)
+        scheduler_running = self._scheduler.running
+        running = settings.for_accounts(profile.accounts)
+        return texts.status_text(
+            running,
+            profile=profile,
+            last_run=await self._last_run(),
+            next_run=next_run_at(settings) if scheduler_running else None,
+            scheduler_running=scheduler_running,
+            stats=self._store.stats(),
+        )
+
+    # ------------------------------------------------------------------ #
+    # 定时检查：一个一个用户跑
+    # ------------------------------------------------------------------ #
 
     async def _on_slot(self, slot: str, settings: PluginSettings) -> None:
-        """到点执行：查一轮 → 按规则决定要不要推。"""
-        try:
-            result = await self._run_once(settings, dry_run=False)
-        except Exception:  # noqa: BLE001 - 单轮异常不能把调度循环带崩
-            logger.exception("定时检查执行失败")
+        """到点执行：对每个有账号的用户各查一轮，各自决定推不推、推给谁。"""
+        profiles = self._store.bindable_profiles()
+        if not profiles:
+            logger.info("定时检查 %s：还没有任何用户绑定账号，跳过", slot)
             return
 
+        logger.info("定时检查 %s：共 %d 个用户要查", slot, len(profiles))
+        webhook_bodies: List[str] = []
+        single_report = None
+        alert_count = 0
+        stamp = self._now_stamp()
+
+        for profile in profiles:
+            targets = self._resolve_targets(profile, settings)
+            try:
+                user_settings = settings.for_accounts(profile.accounts)
+                result = await self._run_once(
+                    user_settings,
+                    history_path=user_history.path_for(profile.key),
+                    dry_run=False,
+                )
+            except Exception:  # noqa: BLE001 - 单个用户炸了不能拖垮整轮
+                logger.exception("用户 %s 的定时检查失败", profile.key)
+                continue
+
+            if result.skipped_reason:
+                logger.info("%s 跳过：%s", profile.key, result.skipped_reason)
+                continue
+
+            report = result.report
+            alert, reason = should_push(
+                settings.test_mode,
+                report.need_alert,
+                len(report.unfinished),
+                always_notify=settings.always_notify,
+                overflow_count=len(report.resource_alerts),
+                activity_count=len(report.activity_alerts),
+            )
+            logger.info(
+                "%s 推送决策：%s（%s）", profile.key, "推送" if alert else "不推送", reason
+            )
+
+            if len(profiles) == 1:
+                single_report = report
+
+            if alert:
+                alert_count += 1
+                if targets:
+                    title, body = report.to_push_payload()
+                    header = "" if len(profiles) == 1 else f"{profile.display} 的日常\n"
+                    delivery = await pusher.push_to_sessions(
+                        self.context, targets, f"{header}{title}\n{body}"
+                    )
+                    logger.info("%s 推送结果：%s", profile.key, delivery)
+                else:
+                    logger.info("%s 有未完成项，但没有提醒去处（未私聊也未订阅）", profile.key)
+
+            if result.cred_alerts and targets:
+                delivery = await pusher.push_to_sessions(
+                    self.context,
+                    targets,
+                    texts.cred_alert_text(result.cred_alerts),
+                )
+                logger.info("%s 凭证提醒：%s", profile.key, delivery)
+
+            if summary := self._summary_line(profile, report):
+                webhook_bodies.append(summary)
+
+            self._store.set_last_check(profile.key, stamp)
+
+        # 一个人都没触发提醒时不必打扰 Webhook（除非配置了「全部完成也通知」）
+        if settings.webhook_enabled and alert_count:
+            await self._deliver_webhook(settings, profiles, single_report, webhook_bodies)
         await self._mark_run()
-        if result.skipped_reason:
-            logger.info("定时检查跳过：%s", result.skipped_reason)
-            return
 
-        report = result.report
-        alert, reason = should_push(
-            settings.test_mode,
-            report.need_alert,
-            len(report.unfinished),
-            always_notify=settings.always_notify,
-            overflow_count=len(report.resource_alerts),
-            activity_count=len(report.activity_alerts),
-        )
-        logger.info("定时检查 %s 推送决策：%s（%s）", slot, "推送" if alert else "不推送", reason)
+    @staticmethod
+    def _summary_line(profile, report) -> str:
+        """给汇总通道用的一行摘要（只说数量，不暴露具体账号）。"""
+        if not report.need_alert:
+            return ""
+        parts: List[str] = []
+        if report.unfinished:
+            parts.append(f"{len(report.unfinished)} 个游戏未完成")
+        if report.resource_alerts:
+            parts.append(f"{len(report.resource_alerts)} 个体力将溢出")
+        if report.activity_alerts:
+            parts.append(f"{len(report.activity_alerts)} 个活动将结束")
+        return f"· {profile.display}：{'、'.join(parts)}"
 
-        if alert and not settings.push_targets and not settings.webhook_enabled:
-            logger.warning(
-                "有未完成项，但还没有配置任何提醒接收方：在群里/私聊发 /日常 订阅 即可"
-            )
-            return
+    async def _deliver_webhook(self, settings, profiles, single_report, summaries) -> None:
+        """Webhook（Bark/飞书…）永远是「整台机器人一个配置」，这里做脱敏汇总。
 
-        if alert:
-            delivery = await self._deliver(settings, report)
-            logger.info("推送结果：%s", delivery.summary())
-
-        if result.cred_alerts:
+        只有一个用户时直接发他的完整报告（单人使用体验不变）；
+        多人时只发人数与计数，避免把某个人的账号状态发到别人的手机上。
+        """
+        try:
+            if len(profiles) == 1 and single_report is not None:
+                title, body = single_report.to_push_payload()
+            else:
+                if not summaries:
+                    return
+                title = f"ResinLoop：{len(summaries)} 人有未完成项"
+                body = "\n".join(summaries)
             delivery = await pusher.deliver(
-                self.context,
-                settings,
-                "凭证可能失效",
-                texts.cred_alert_text(result.cred_alerts),
+                self.context, settings, title, body, targets=[]
             )
-            logger.info("凭证提醒：%s", delivery.summary())
+            logger.info("Webhook 汇总：%s", delivery.summary())
+        except Exception:  # noqa: BLE001
+            logger.exception("Webhook 汇总推送失败")
 
     # ------------------------------------------------------------------ #
-    # 订阅
+    # 提醒去处（按用户）
     # ------------------------------------------------------------------ #
 
-    def _toggle_subscription(self, umo: str, subscribe: bool) -> tuple[bool, str]:
-        targets = list(self._settings().push_targets)
+    def _resolve_targets(self, profile, settings: PluginSettings) -> List[str]:
+        """按 push_scope 算出「这条提醒该发到哪」。
+
+        private_first（默认）：私聊过就只发私聊（群里不会出现别人的账号状态），
+        没私聊过才退回他订阅过的会话。
+        """
+        private = profile.private_umo
+        subscribed = list(profile.targets)
+        scope = settings.push_scope
+
+        if scope == "private_only":
+            return [private] if private else []
+        if scope == "session_only":
+            return subscribed
+        # private_first
+        if private:
+            return [private]
+        return subscribed
+
+    # ------------------------------------------------------------------ #
+    # 订阅 / 解绑 / 认领
+    # ------------------------------------------------------------------ #
+
+    def _toggle_subscription(self, event: AstrMessageEvent, subscribe: bool) -> str:
+        profile = self._profile(event)
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if not umo:
+            return "拿不到当前会话标识，订阅失败（可能是平台适配器不支持）。"
+
         if subscribe:
-            if umo in targets:
-                return True, f"本会话已经在提醒列表里了：\n{umo}"
-            targets.append(umo)
+            added = self._store.subscribe(profile.key, umo)
+            profile = self._store.profile(profile.key)
+            head = "已把当前会话加入你的提醒列表" if added else "当前会话已经在你的提醒列表里"
+            lines = [f"{head}（共 {len(profile.targets)} 个）：", umo]
+            if not profile.has_accounts:
+                lines.append("")
+                lines.append("但你还没绑定账号，先发 /日常 登录米游社 或 /日常 登录森空岛。")
+            if profile.private_umo:
+                lines.append("")
+                lines.append("你在私聊里也发过命令，默认会把提醒发到私聊；群里不会看到你的账号状态。")
+            return "\n".join(lines)
+
+        removed = self._store.unsubscribe(profile.key, umo)
+        if not removed:
+            return "当前会话不在你的提醒列表里，无需退订。"
+        profile = self._store.profile(profile.key)
+        left = len(profile.targets)
+        tail = f"还有 {left} 个会话。" if left else "已全部退订。"
+        return f"已退订当前会话，{tail}"
+
+    def _handle_unbind(self, event: AstrMessageEvent, arg: str) -> str:
+        profile = self._profile(event)
+        if not profile.accounts:
+            return "你还没有绑定任何账号。"
+        if not arg:
+            bound = "、".join(
+                GAME_LABELS.get(item.game, item.game) for item in profile.accounts
+            )
+            return (
+                f"要解绑哪个游戏？你当前绑定：{bound}\n"
+                "例：/日常 解绑 原神\n"
+                "要全部删除请明确发：/日常 解绑 全部"
+            )
+
+        wanted = arg.strip().replace(" ", "")
+        if wanted in ("全部", "所有", "all"):
+            game = ""
         else:
-            if umo not in targets:
-                return True, "本会话不在提醒列表里，无需退订。"
-            targets = [item for item in targets if item != umo]
-        self.config["push_targets"] = targets
+            game = GAME_ALIASES.get(wanted) or (
+                wanted if wanted in GAME_LABELS else ""
+            )
+            if not game:
+                return (
+                    f"不认识「{arg}」。可用的写法："
+                    + "、".join(GAME_LABELS.values())
+                    + "，或「全部」"
+                )
+        removed = self._store.unbind(profile.key, game)
+        remain = len(self._store.profile(profile.key).accounts)
+        logger.info("%s 解绑 %s：%s", profile.key, game or "全部", removed)
+        return texts.unbind_text(removed, remain)
+
+    def _handle_claim(self, event: AstrMessageEvent) -> str:
+        """把旧版「全局配置账号」并到管理员名下，然后清空配置。"""
+        if not event.is_admin():
+            return "只有管理员可以把旧配置里的账号认领给某个人。"
+        rows = self.config.get("accounts")
+        if not isinstance(rows, list) or not rows:
+            return texts.claim_text(0)
+
+        profile = self._profile(event)
+        settings = self._settings()
+        added = self._store.claim_legacy(profile.key, rows, settings.push_targets)
+        if added <= 0:
+            return texts.claim_text(0)
+
+        self.config["accounts"] = []
+        self.config["push_targets"] = []
         self._save_config()
-        if subscribe:
-            return True, f"已把本会话设为提醒接收方（共 {len(targets)} 个）：\n{umo}"
-        return True, f"已退订，当前还有 {len(targets)} 个提醒会话。"
+        if user_history.migrate_shared_to(profile.key):
+            logger.info("旧的历史存档已复制给 %s", profile.key)
+        return texts.claim_text(added)
 
     def _save_config(self) -> None:
         try:
@@ -381,23 +715,32 @@ class ResinLoopPlugin(Star):
             logger.warning("保存插件配置失败：%s", exc)
 
     # ------------------------------------------------------------------ #
-    # 扫码登录
+    # 扫码登录（每人各自的会话）
     # ------------------------------------------------------------------ #
 
     async def _handle_login(self, event: AstrMessageEvent, action: str):
-        if not event.is_admin():
-            yield event.plain_result("扫码登录会写入账号凭证，只有管理员可以操作。")
-            return
-        if self._login_kind:
+        profile = self._profile(event)
+        key = profile.key
+
+        if key in self._login_sessions:
             yield event.plain_result(
-                f"已经有一个 {self._login_kind} 扫码会话在等待，先完成或等它超时（3 分钟）。"
+                f"你有一个 {self._login_sessions[key]} 扫码会话在等待，"
+                "先完成或等它超时（3 分钟）。"
+            )
+            return
+
+        settings = self._settings()
+        if len(self._login_sessions) >= settings.max_login_sessions:
+            yield event.plain_result(
+                f"同时进行的扫码会话已达上限（{settings.max_login_sessions} 个），"
+                "稍等别人扫完再来。"
             )
             return
 
         kind = "mihoyo" if action == "login_mihoyo" else "skland"
         begin = login.begin_mihoyo if kind == "mihoyo" else login.begin_skland
         try:
-            session = await begin()
+            session = await begin(userstore.file_stem(key)[-10:])
         except login.LoginError as exc:
             yield event.plain_result(f"❌ {exc}")
             return
@@ -412,34 +755,40 @@ class ResinLoopPlugin(Star):
         else:
             chain.append(Plain("（二维码图片生成失败，请把下面这串内容转成二维码）\n"))
             chain.append(Plain(session.url))
-        chain.append(Plain(f"\n{session.hint()}，3 分钟内有效。"))
+        tail = f"\n{session.hint()}，3 分钟内有效。\n绑定只写到你名下，不影响其他人。"
+        if not self._is_private(event):
+            tail += "\n（二维码别刷群：建议私聊我扫码，这里只贴这一次）"
+        chain.append(Plain(tail))
         yield event.chain_result(chain)
 
-        self._login_kind = kind
+        self._login_sessions[key] = kind
         task = asyncio.create_task(
-            self._await_login(session, event.unified_msg_origin),
-            name=f"resinloop-login-{kind}",
+            self._await_login(session, key, str(getattr(event, "unified_msg_origin", ""))),
+            name=f"resinloop-login-{kind}-{key}",
         )
         self._login_tasks.add(task)
         task.add_done_callback(self._login_tasks.discard)
 
-    async def _await_login(self, session: login.QrSession, umo: str) -> None:
-        """后台等扫码结果，完成后回一条消息到发起命令的会话。"""
+    async def _await_login(self, session: login.QrSession, key: str, umo: str) -> None:
+        """后台等扫码结果，完成后写进这个用户自己的账号表。"""
         from astrbot.api.event import MessageChain
 
         try:
             if session.kind == "mihoyo":
                 payload = await login.finish_mihoyo(session)
+                rows = self._store.login_rows(key)
                 games = settings_mod.apply_mihoyo_login(
-                    self.config, payload["cookie"], payload.get("roles") or {}
+                    {"accounts": rows}, payload["cookie"], payload.get("roles") or {}
                 )
                 extra = f"设备已绑定：{payload['device_id'][:8]}…（三款游戏共用）"
             else:
                 payload = await login.finish_skland(session)
-                games = settings_mod.apply_skland_login(self.config, payload["token"])
+                rows = self._store.login_rows(key)
+                games = settings_mod.apply_skland_login({"accounts": rows}, payload["token"])
                 extra = f"Token 已保存（{settings_mod.mask_secret(payload['token'])}）"
-            self._save_config()
+            self._store.save_login_rows(key)
             text = texts.login_done_text(session.kind, games, extra)
+            text += "\n这些账号只属于你，其他人查不到。"
         except login.LoginError as exc:
             text = f"❌ 登录失败：{exc}"
         except asyncio.CancelledError:
@@ -448,7 +797,7 @@ class ResinLoopPlugin(Star):
             logger.exception("扫码登录流程异常")
             text = f"❌ 登录失败：{exc}"
         finally:
-            self._login_kind = None
+            self._login_sessions.pop(key, None)
 
         try:
             await self.context.send_message(umo, MessageChain().message(text))
@@ -456,39 +805,33 @@ class ResinLoopPlugin(Star):
             logger.warning("登录结果回传失败：%s", exc)
 
     # ------------------------------------------------------------------ #
-    # LLM 工具：让 AI 也能查日常
+    # LLM 工具：让 AI 也能查（同样是「谁问查谁」）
     # ------------------------------------------------------------------ #
 
     @filter.llm_tool(name="query_game_daily_status")
     async def query_game_daily_status(self, event: AstrMessageEvent, game: str = ""):
-        """查询游戏「今天的日常任务」完成情况：原神、崩坏：星穹铁道、绝区零、明日方舟、终末地。
+        """查询「这个人自己的」游戏日常任务完成情况：原神、崩坏：星穹铁道、绝区零、明日方舟、终末地。
 
         只读接口，不会签到、不会领奖励、不会修改任何游戏数据。
         当用户问「我今天的日常做完了吗」「树脂/体力满了没」「帮我看看还有哪些没做」时调用。
 
         Args:
-            game(string): 可选，游戏名或标识（genshin/starrail/zzz/arknights/endfield）；留空表示查询全部已绑定游戏。
+            game(string): 可选，游戏名或标识（genshin/starrail/zzz/arknights/endfield）；留空表示查询本人已绑定的全部游戏。
         """
-        settings = self._settings()
-        if not settings.ready:
-            return "用户还没有绑定任何游戏账号，无法查询。可提示其在管理员处执行 /日常 登录米游社 绑定。"
+        profile = self._profile(event)
+        if not profile.has_accounts:
+            return "这位用户还没有绑定任何游戏账号。提示他私聊发送 /日常 登录米游社 或 /日常 登录森空岛 自行绑定。"
 
-        result = await self._run_once(settings, dry_run=True)
+        settings = self._settings().for_accounts(profile.accounts)
+        result = await self._run_once(
+            settings, dry_run=True, history_path=user_history.path_for(profile.key)
+        )
         report = result.report
         statuses = report.statuses
 
         wanted = (game or "").strip().lower()
         if wanted:
-            alias = {
-                "原神": "genshin",
-                "星铁": "starrail",
-                "崩铁": "starrail",
-                "崩坏星穹铁道": "starrail",
-                "绝区零": "zzz",
-                "明日方舟": "arknights",
-                "方舟": "arknights",
-                "终末地": "endfield",
-            }.get(wanted, wanted)
+            alias = GAME_ALIASES.get(wanted, wanted)
             statuses = [item for item in statuses if item.game_id == alias]
             if not statuses:
                 return f"没有查询到「{game}」的账号或数据。"

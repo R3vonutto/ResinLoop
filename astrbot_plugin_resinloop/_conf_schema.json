@@ -8,7 +8,10 @@
   "check_times": {
     "type": "list",
     "description": "每日检查时间点",
-    "default": ["08:30", "20:30"],
+    "default": [
+      "08:30",
+      "20:30"
+    ],
     "items": {
       "type": "string"
     },
@@ -22,12 +25,12 @@
   },
   "push_targets": {
     "type": "list",
-    "description": "提醒接收会话（UMO）",
+    "description": "旧版全局提醒会话（已废弃）",
     "default": [],
     "items": {
       "type": "string"
     },
-    "hint": "在群里发 /日常 订阅 会自动填入，一般不用手改。格式：平台:group|private:会话ID"
+    "hint": "多人版改为每人自己的订阅，这一项只在 /日常 认领 时作为遗留数据并入管理员名下；新装用户不用管它。"
   },
   "always_notify": {
     "type": "bool",
@@ -39,14 +42,56 @@
     "type": "string",
     "description": "推送模式",
     "default": "auto",
-    "options": ["auto", "force_alert", "force_silent"],
-    "labels": ["自动判断（有未完成才推）", "强制提醒（每轮都推）", "强制静默（只写日志）"],
+    "options": [
+      "auto",
+      "force_alert",
+      "force_silent"
+    ],
+    "labels": [
+      "自动判断（有未完成才推）",
+      "强制提醒（每轮都推）",
+      "强制静默（只写日志）"
+    ],
     "hint": "排查推送通道时临时切「强制提醒」，确认没问题再切回 auto"
+  },
+  "push_scope": {
+    "type": "string",
+    "description": "定时提醒发到哪",
+    "default": "private_first",
+    "options": [
+      "private_first",
+      "session_only",
+      "private_only"
+    ],
+    "labels": [
+      "私聊优先（群里不串号）",
+      "只发订阅的会话",
+      "只发私聊"
+    ],
+    "hint": "私聊优先：跟你私聊过就只发私聊，没私聊过才发到你订阅过的群；多人共用同一个群时，这样不会把别人的账号状态发到群里。"
+  },
+  "query_cache_seconds": {
+    "type": "int",
+    "description": "同一用户查询缓存（秒）",
+    "default": 90,
+    "hint": "群里连着问几次不会重复打接口；填 0 关闭。/日常 测试推送 会强制刷新。"
+  },
+  "command_cooldown_seconds": {
+    "type": "int",
+    "description": "同一用户两次检查的最小间隔（秒）",
+    "default": 10,
+    "hint": "防止刷屏和打爆接口；填 0 关闭。"
+  },
+  "max_login_sessions": {
+    "type": "int",
+    "description": "同时进行的扫码会话上限",
+    "default": 3,
+    "hint": "多人各自扫码时互不阻塞，超过上限会提示稍后再来。"
   },
   "accounts": {
     "type": "template_list",
-    "description": "游戏账号",
-    "hint": "推荐用 /日常 登录米游社、/日常 登录森空岛 扫码自动写入，手填只用于迁移旧配置",
+    "description": "旧版全局账号（已废弃）",
+    "hint": "现在每个人用自己的账号：发 /日常 登录米游社 或 /日常 登录森空岛 扫码，只写进本人的绑定。这里只用于迁移旧配置——升级后由管理员发一次 /日常 认领 并入自己名下，然后清空。",
     "templates": {
       "account": {
         "name": "游戏账号",
@@ -55,8 +100,20 @@
             "type": "string",
             "description": "游戏",
             "default": "genshin",
-            "options": ["genshin", "starrail", "zzz", "arknights", "endfield"],
-            "labels": ["原神", "崩坏：星穹铁道", "绝区零", "明日方舟", "终末地"]
+            "options": [
+              "genshin",
+              "starrail",
+              "zzz",
+              "arknights",
+              "endfield"
+            ],
+            "labels": [
+              "原神",
+              "崩坏：星穹铁道",
+              "绝区零",
+              "明日方舟",
+              "终末地"
+            ]
           },
           "nickname": {
             "type": "string",
@@ -159,16 +216,30 @@
     "type": "string",
     "description": "米游社设备模式",
     "default": "auto",
-    "options": ["auto", "fp", "gs"],
-    "labels": ["auto（推荐，带重试）", "fp（始终带完整设备头）", "gs（最小指纹，排障用）"],
+    "options": [
+      "auto",
+      "fp",
+      "gs"
+    ],
+    "labels": [
+      "auto（推荐，带重试）",
+      "fp（始终带完整设备头）",
+      "gs（最小指纹，排障用）"
+    ],
     "hint": "遇到 5003 / 1034 等风控 retcode 时，先试 auto，仍然失败再看日志里的链路探针提示"
   },
   "mihoyo_task_scope": {
     "type": "string",
     "description": "米游社完成度口径",
     "default": "daily",
-    "options": ["daily", "full"],
-    "labels": ["daily（只看每日委托等判定项）", "full（树脂/派遣/周积分也算）"],
+    "options": [
+      "daily",
+      "full"
+    ],
+    "labels": [
+      "daily（只看每日委托等判定项）",
+      "full（树脂/派遣/周积分也算）"
+    ],
     "hint": "daily 时树脂、派遣等资源数据只展示不判定，避免「树脂没花完」被当成日常没做"
   },
   "proxy": {

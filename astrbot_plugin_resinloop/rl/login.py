@@ -71,7 +71,13 @@ def render_qr_png(content: str, path: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 
-async def begin_mihoyo() -> QrSession:
+def _qr_path(kind: str, tag: str) -> Path:
+    """二维码落盘路径。多人同时扫码时靠 ``tag`` 区分，不会互相覆盖。"""
+    suffix = f"_{tag}" if tag else ""
+    return LOGS_DIR / f"qr_{kind}{suffix}.png"
+
+
+async def begin_mihoyo(tag: str = "") -> QrSession:
     """创建米游社扫码会话并渲染二维码。"""
     try:
         device_id = mihoyo_api.identity_device_id()
@@ -82,7 +88,7 @@ async def begin_mihoyo() -> QrSession:
     png: Optional[Path] = None
     try:
         png = await asyncio.to_thread(
-            render_qr_png, session["url"], LOGS_DIR / "qr_mihoyo.png"
+            render_qr_png, session["url"], _qr_path("mihoyo", tag)
         )
     except LoginError:
         png = None
@@ -136,7 +142,7 @@ async def finish_mihoyo(
 # --------------------------------------------------------------------------- #
 
 
-async def begin_skland() -> QrSession:
+async def begin_skland(tag: str = "") -> QrSession:
     """创建鹰角通行证扫码会话并渲染二维码。"""
     try:
         session = await asyncio.to_thread(hypergryph_login.create_qr)
@@ -146,7 +152,7 @@ async def begin_skland() -> QrSession:
     png: Optional[Path] = None
     try:
         png = await asyncio.to_thread(
-            render_qr_png, session["scan_url"], LOGS_DIR / "qr_skland.png"
+            render_qr_png, session["scan_url"], _qr_path("skland", tag)
         )
     except LoginError:
         png = None

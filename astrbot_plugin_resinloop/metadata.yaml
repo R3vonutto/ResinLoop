@@ -9,8 +9,11 @@ desc: |
   群或私聊；顺带支持体力溢出预警（树脂 / 开拓力 / 电量 / 理智）与活动结束提醒，也可以
   继续对接 Bark、Server酱、Qmsg酱、飞书、钉钉等 Webhook。
 
+  多人独立：账号、历史、提醒全部按「平台 + 发送者」隔离。群里每个人各自扫码绑定自己的号，
+  查到的永远是自己的那份；定时提醒一人一条，不会把别人的账号状态发到群里。
+
   严格只读：不签到、不领奖励、不修改任何游戏数据。
-version: v1.0.0
+version: v1.1.0
 author: R3vonutto
 repo: https://github.com/R3vonutto/ResinLoop
 astrbot_version: ">=4.16,<5"

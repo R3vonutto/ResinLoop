@@ -2,7 +2,7 @@
   "metadata": {
     "display_name": "ResinLoop 日常巡查",
     "short_desc": "米游社 / 森空岛的每日任务没做完？到点提醒你（只查询，不签到）",
-    "desc": "移植自 ResinLoop 的 AstrBot 插件。支持原神、崩坏：星穹铁道、绝区零、明日方舟、终末地；到点巡检日常进度并推送到订阅的群或私聊，支持体力溢出预警与活动结束提醒。严格只读：不签到、不领奖励、不修改游戏数据。"
+    "desc": "移植自 ResinLoop 的 AstrBot 插件。支持原神、崩坏：星穹铁道、绝区零、明日方舟、终末地；到点巡检日常进度并推送到私聊或订阅的群，支持体力溢出预警与活动结束提醒。账号按用户隔离：群里每个人各自绑定、各查各的。严格只读：不签到、不领奖励、不修改游戏数据。"
   },
   "config": {
     "check_times": {
@@ -10,12 +10,12 @@
       "hint": "24 小时制 HH:MM，可填多个"
     },
     "push_targets": {
-      "description": "提醒接收会话（UMO）",
-      "hint": "在群里发 /日常 订阅 会自动填入"
+      "description": "旧版全局提醒会话（已废弃）",
+      "hint": "现在改为每人自己的订阅，只用于 /日常 认领 时并入管理员名下"
     },
     "accounts": {
-      "description": "游戏账号",
-      "hint": "推荐用 /日常 登录米游社、/日常 登录森空岛 扫码自动写入"
+      "description": "旧版全局账号（已废弃）",
+      "hint": "现在每人用自己的账号：/日常 登录米游社 只写进本人的绑定；这里仅供升级时 /日常 认领 迁移"
     },
     "resource_thresholds": {
       "description": "各游戏体力溢出阈值",
@@ -24,6 +24,22 @@
     "webhooks": {
       "description": "Webhook 配置",
       "hint": "只填你想用的通道，留空即跳过"
+    },
+    "push_scope": {
+      "description": "定时提醒发到哪",
+      "hint": "私聊优先：私聊过就只发私聊，群里不会出现别人的账号状态"
+    },
+    "query_cache_seconds": {
+      "description": "同一用户查询缓存（秒）",
+      "hint": "填 0 关闭；/日常 测试推送 会强制刷新"
+    },
+    "command_cooldown_seconds": {
+      "description": "同一用户两次检查的最小间隔（秒）",
+      "hint": "填 0 关闭"
+    },
+    "max_login_sessions": {
+      "description": "同时进行的扫码会话上限",
+      "hint": "多人各自扫码时互不阻塞"
     }
   },
   "commands": {

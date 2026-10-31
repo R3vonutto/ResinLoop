@@ -17,25 +17,133 @@ LINE = "─" * 24
 MAX_REPORT_LINES = 46
 
 
-def help_text(settings: PluginSettings) -> str:
+def help_text(settings: PluginSettings, *, bound: bool = False) -> str:
     prefix = "/日常"
-    return "\n".join(
-        [
-            "🌱 ResinLoop · 游戏日常巡查",
-            LINE,
-            f"{prefix}            立即检查一轮并回复结果",
-            f"{prefix} 状态       账号 / 定时 / 订阅概览",
-            f"{prefix} 周报       最近 7 天完成情况",
-            f"{prefix} 活动       即将结束的活动",
-            f"{prefix} 订阅       把当前会话设为提醒接收方",
-            f"{prefix} 退订       取消当前会话的订阅",
-            f"{prefix} 登录米游社  扫码绑定原神 / 崩铁 / 绝区零",
-            f"{prefix} 登录森空岛  扫码绑定明日方舟 / 终末地",
-            f"{prefix} 测试推送    按当前结果推一条到订阅会话",
-            LINE,
-            "只查询、只提醒：不签到、不领奖励、不改任何游戏数据。",
-            "定时检查在 WebUI 插件配置里改「检查时间点」。",
-        ]
+    lines = [
+        "🌱 ResinLoop · 游戏日常巡查",
+        LINE,
+        f"{prefix}            立即检查【你自己的】账号",
+        f"{prefix} 状态       你的绑定 / 提醒设置",
+        f"{prefix} 周报       你自己最近 7 天的完成情况",
+        f"{prefix} 活动       即将结束的活动",
+        f"{prefix} 登录米游社  扫码绑定原神 / 崩铁 / 绝区零",
+        f"{prefix} 登录森空岛  扫码绑定明日方舟 / 终末地",
+        f"{prefix} 订阅       在【当前会话】接收你的定时提醒",
+        f"{prefix} 退订       取消当前会话的提醒",
+        f"{prefix} 解绑 [游戏] 删除你自己的绑定（不给参数则全删）",
+        f"{prefix} 测试推送    按当前结果给你自己推一条",
+        LINE,
+        "账号按「平台 + 用户」各自独立，群里每个人查到的都是自己那份。",
+        "只查询、只提醒：不签到、不领奖励、不改任何游戏数据。",
+    ]
+    if not bound:
+        lines.append("现在还没有绑定，先来一句：" + f"{prefix} 登录米游社")
+    return "\n".join(lines)
+
+
+def binding_hint(prefix: str = "/日常") -> str:
+    return (
+        "你还没有绑定任何游戏账号。\n"
+        f"私聊我发「{prefix} 登录米游社」或「{prefix} 登录森空岛」扫码即可，"
+        "绑定只对你自己生效。"
+    )
+
+
+def status_text(
+    settings: PluginSettings,
+    *,
+    profile: Any = None,
+    last_run: str = "",
+    next_run: Optional[datetime] = None,
+    scheduler_running: bool = False,
+    stats: Optional[Dict[str, int]] = None,
+) -> str:
+    """个人状态：只看自己的账号与提醒设置，末尾附一行全局人数。"""
+    lines: List[str] = []
+    if profile is not None:
+        lines.append(f"📋 我的状态｜{profile.display}")
+    else:
+        lines.append("📋 ResinLoop 状态")
+    lines.append(LINE)
+
+    accounts = list(getattr(profile, "accounts", []) or []) if profile is not None else list(settings.accounts)
+    if not accounts:
+        lines.append("账号：还没有绑定（/日常 登录米游社）")
+    else:
+        enabled = [item for item in accounts if item.enabled]
+        lines.append(f"账号（{len(enabled)}/{len(accounts)} 启用）：")
+        for account in accounts:
+            mark = "✓" if account.enabled else "✗"
+            label = GAME_LABELS.get(account.game, account.game)
+            who = account.nickname or "未命名"
+            uid = str((account.credential or {}).get("uid") or "")
+            lines.append(f"  {mark} {label}｜{who}" + (f"（UID {uid}）" if uid else ""))
+
+    lines.append("")
+    if profile is not None:
+        private = "已记住，提醒优先发私聊" if getattr(profile, "private_umo", "") else "还没私聊过我"
+        lines.append(f"私聊：{private}")
+        targets = list(getattr(profile, "targets", []) or [])
+        lines.append(f"订阅会话：{len(targets)} 个")
+        for target in targets[:3]:
+            lines.append(f"  · {target}")
+        if len(targets) > 3:
+            lines.append(f"  · …共 {len(targets)} 个")
+    else:
+        lines.append(f"推送会话：{len(settings.push_targets)} 个")
+        for target in settings.push_targets[:3]:
+            lines.append(f"  · {target}")
+
+    lines.append("")
+    lines.append(f"定时：{'、'.join(settings.check_times) or '未设置'}")
+    lines.append(
+        f"调度：{'运行中' if scheduler_running else '已停止'}"
+        + (f"，下次 {next_run:%m-%d %H:%M}" if next_run else "")
+    )
+    stamp = getattr(profile, "last_check", "") or last_run
+    if stamp:
+        lines.append(f"上次检查：{stamp}")
+
+    alert_parts: List[str] = []
+    if settings.resource_alert_enabled:
+        for game in ("genshin", "starrail", "zzz", "arknights", "endfield"):
+            threshold = settings.thresholds.get(game) or 0
+            if threshold > 0:
+                alert_parts.append(f"{GAME_LABELS[game]}≥{threshold}")
+    lines.append("体力预警：" + ("、".join(alert_parts) if alert_parts else "关闭"))
+
+    if stats:
+        lines.append(
+            f"全局：{stats.get('bound', 0)} 人已绑定 / {stats.get('users', 0)} 人用过插件"
+        )
+    return "\n".join(lines)
+
+
+def cooldown_text(seconds: int) -> str:
+    return f"刚查过，{max(1, int(seconds))} 秒后再试（防止把接口打爆）。"
+
+
+def cache_note(age_seconds: int) -> str:
+    age = max(0, int(age_seconds))
+    when = "刚刚" if age < 5 else f"{age} 秒前"
+    return f"\n（这是{when}的缓存结果，/日常 测试推送 可强制刷新）"
+
+
+def unbind_text(removed: List[str], remain: int) -> str:
+    if not removed:
+        return "没有找到要解绑的账号。"
+    text = "已解绑：" + "、".join(removed)
+    if remain:
+        return text + f"\n还剩 {remain} 个账号。"
+    return text + "\n账号已清空，随时可以重新扫码绑定。"
+
+
+def claim_text(added: int) -> str:
+    if added <= 0:
+        return "配置里没有可认领的旧账号（或这些游戏你都已经绑过了）。"
+    return (
+        f"已把配置里的 {added} 个旧账号并入你名下，并把配置清空。\n"
+        "以后的日常检查只认你自己的绑定，别人看不到。"
     )
 
 
@@ -66,55 +174,6 @@ def push_text(report: Any) -> str:
         return "游戏日常：报告渲染失败，请查看插件日志。"
     return f"{title}\n{body}"
 
-
-def status_text(
-    settings: PluginSettings,
-    *,
-    last_run: str = "",
-    next_run: Optional[datetime] = None,
-    scheduler_running: bool = False,
-) -> str:
-    lines: List[str] = ["📋 ResinLoop 状态", LINE]
-
-    if not settings.accounts:
-        lines.append("账号：还没有绑定任何游戏")
-    else:
-        lines.append(f"账号（{len(settings.enabled_accounts)}/{len(settings.accounts)} 启用）：")
-        for account in settings.accounts:
-            mark = "✓" if account.enabled else "✗"
-            who = account.nickname or "未命名"
-            lines.append(f"  {mark} {GAME_LABELS.get(account.game, account.game)}｜{who}")
-
-    lines.append("")
-    lines.append(f"定时：{'、'.join(settings.check_times) or '未设置'}")
-    lines.append(
-        f"调度：{'运行中' if scheduler_running else '已停止'}"
-        + (f"，下次 {next_run:%m-%d %H:%M}" if next_run else "")
-    )
-    if last_run:
-        lines.append(f"上次：{last_run}")
-
-    lines.append("")
-    lines.append(f"推送会话：{len(settings.push_targets)} 个")
-    for target in settings.push_targets[:5]:
-        lines.append(f"  · {target}")
-    if len(settings.push_targets) > 5:
-        lines.append(f"  · …共 {len(settings.push_targets)} 个")
-    lines.append(f"Webhook：{'开启' if settings.webhook_enabled else '关闭'}")
-
-    alert_parts: List[str] = []
-    if settings.resource_alert_enabled:
-        for game in ("genshin", "starrail", "zzz", "arknights", "endfield"):
-            threshold = settings.thresholds.get(game) or 0
-            if threshold > 0:
-                alert_parts.append(f"{GAME_LABELS[game]}≥{threshold}")
-    lines.append("体力预警：" + ("、".join(alert_parts) if alert_parts else "关闭"))
-    lines.append(
-        f"活动提醒：{'结束前 %d 天' % settings.activity_alert_days if settings.activity_alert_enabled else '关闭'}"
-    )
-    support = "米游社 + 森空岛" if settings.ready else "未绑定账号（仅手动查询）"
-    lines.append(f"数据源：{support}")
-    return "\n".join(lines)
 
 
 def weekly_text(digest: Dict[str, Any]) -> str:
@@ -204,11 +263,16 @@ def cred_alert_text(alerts: List[Dict[str, Any]]) -> str:
 
 __all__ = [
     "activity_text",
+    "binding_hint",
+    "cache_note",
+    "claim_text",
+    "cooldown_text",
     "cred_alert_text",
     "help_text",
     "login_done_text",
     "push_text",
     "report_text",
     "status_text",
+    "unbind_text",
     "weekly_text",
 ]
